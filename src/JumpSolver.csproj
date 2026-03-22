@@ -13,7 +13,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AssemblyName>JumpSolver</AssemblyName>
     <RootNamespace>JumpSolver</RootNamespace>
-    <Version>0.1.0.0</Version>
+    <Version>0.3.0.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>

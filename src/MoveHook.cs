@@ -23,6 +23,12 @@ internal sealed unsafe class MoveHook : IDisposable
     public float InjectedLeft    { get; set; }   //  1 = full left,     -1 = right
     public bool  Injecting       => InjectedForward != 0f || InjectedLeft != 0f;
 
+    // ── Natural (pre-injection) values from last RMI frame ───────────────────
+    // These are what the game computed from real keyboard/gamepad input BEFORE
+    // we overwrite them. Useful for comparing natural vs injected movement.
+    public float LastNaturalForward { get; private set; }
+    public float LastNaturalLeft    { get; private set; }
+
     // ── Whether the hook was installed successfully ───────────────────────────
     public bool IsAvailable => rmiWalkHook != null;
 
@@ -87,6 +93,9 @@ internal sealed unsafe class MoveHook : IDisposable
             bool result = rmiWalkHook!.Original(
                 self, sumLeft, sumForward, sumTurnLeft,
                 haveBackwardOrStrafe, a6, a7);
+
+            LastNaturalForward = *sumForward;
+            LastNaturalLeft    = *sumLeft;
 
             if (Injecting)
             {

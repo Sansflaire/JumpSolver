@@ -41,5 +41,12 @@ internal static class Signatures
     /// ActionManager->UseAction(ActionType.General, JumpActionId, selfEntityId)
     /// This is stable across patches — general action IDs don't change.
     /// </summary>
-    internal const uint JumpActionId = 2;
+    internal const uint JumpActionId   = 2;
+
+    /// <summary>
+    /// General action ID for Sprint.
+    /// ActionManager->UseAction(ActionType.General, SprintActionId, selfEntityId)
+    /// Stable across patches — general action IDs don't change.
+    /// </summary>
+    internal const uint SprintActionId = 4;
 }

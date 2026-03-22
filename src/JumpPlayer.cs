@@ -7,48 +7,33 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace JumpSolver;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Playback state machine
-//
-// STATES
-//   Idle      – not running
-//   Aligning  – walking to / snapping the start point
-//   Playing   – executing steps in sequence
-//
-// PER STEP EXECUTION
-//   1. Set player facing to step.FacingAngle (instant rotation write)
-//   2. Enable MoveHook forward injection (player moves forward at full speed)
-//   3. After step.JumpDelayMs, fire jump via ActionManager
-//   4. After step.MoveDurationMs, disable injection → advance to next step
-//
-// ALIGNMENT
-//   If the player is within StartPoint.SnapRadius yalms of the start, we:
-//     a. Set rotation to StartPoint.Facing
-//     b. (TODO) Drive vnavmesh to walk to the exact position
-//   For now, if the player is already close enough we snap and go.
-// ──────────────────────────────────────────────────────────────────────────────
+public enum PlayState { Idle, WalkingToStart, Playing }
 
-public enum PlayState { Idle, Aligning, Playing }
-
-public sealed unsafe class JumpPlayer
+internal sealed unsafe class JumpPlayer
 {
     public PlayState State     { get; private set; } = PlayState.Idle;
     public int       StepIndex { get; private set; }
-    public float     StepTimer { get; private set; }   // ms elapsed in current step
+    public float     StepTimer { get; private set; }
 
-    private JumpPuzzle?   puzzle;
-    private MoveHook      mover;
-    private readonly IPluginLog     log;
-    private readonly IObjectTable   objects;
-    private readonly IChatGui       chat;
+    private JumpPuzzle?  puzzle;
+    private readonly MoveHook    mover;
+    private readonly IObjectTable objects;
+    private readonly IChatGui    chat;
+    private readonly IPluginLog  log;
 
-    // Per-step state
-    private bool jumpFired;
-    private bool facingSet;
+    private bool  jumpFired;
+    private bool  facingSet;
+
+    // Walk-to-start locking phase
+    private bool  locking    = false;
+    private float lockTimer  = 0f;
+    private const float WalkSlowRadius  = 1.5f;   // begin slowing within this many yalms
+    private const float WalkSnapRadius  = 0.04f;  // snap position when this close (~4cm)
+    private const float LockDurationMs  = 350f;   // hold exact position this long (server acceptance)
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    public JumpPlayer(MoveHook mover, IObjectTable objects, IChatGui chat, IPluginLog log)
+    internal JumpPlayer(MoveHook mover, IObjectTable objects, IChatGui chat, IPluginLog log)
     {
         this.mover   = mover;
         this.objects = objects;
@@ -61,50 +46,67 @@ public sealed unsafe class JumpPlayer
     public bool TryStart(JumpPuzzle puzzle, out string error)
     {
         error = string.Empty;
-
-        if (puzzle.Start == null)          { error = "No start point set.";              return false; }
-        if (puzzle.Steps.Count == 0)       { error = "No steps — add or record some.";   return false; }
-
+        if (puzzle.Start == null)        { error = "No start point set.";            return false; }
+        if (puzzle.Steps.Count == 0)     { error = "No steps to run.";               return false; }
         var player = objects.LocalPlayer;
-        if (player == null)                { error = "Not logged in.";                   return false; }
-
-        if (!mover.IsAvailable)
-            chat.Print("[JumpSolver] WARNING: Movement hook unavailable — steps without working injection.");
+        if (player == null)              { error = "Not logged in.";                 return false; }
 
         float dist = Vector3.Distance(player.Position, puzzle.Start.Position);
         if (dist > puzzle.Start.SnapRadius)
         {
-            error = $"Too far from start ({dist:F1} yalms). Get within {puzzle.Start.SnapRadius} yalms.";
+            error = $"Too far from start ({dist:F1} yalms, need ≤ {puzzle.Start.SnapRadius:F0}).";
             return false;
         }
 
         this.puzzle = puzzle;
-        StepIndex   = 0;
-        StepTimer   = 0f;
-        jumpFired   = false;
-        facingSet   = false;
-        State       = PlayState.Aligning;
+        BeginSteps();
+        return true;
+    }
 
-        log.Info($"JumpPlayer: starting '{puzzle.Name}', {puzzle.Steps.Count} steps.");
+    /// <summary>Walk beeline to the start point, snap facing on arrival.</summary>
+    public bool TryWalkToStart(JumpPuzzle puzzle, out string error)
+    {
+        error = string.Empty;
+        if (puzzle.Start == null)    { error = "No start point set.";  return false; }
+        var player = objects.LocalPlayer;
+        if (player == null)          { error = "Not logged in.";        return false; }
+
+        float dist = Vector3.Distance(player.Position, puzzle.Start.Position);
+        if (dist > puzzle.Start.SnapRadius)
+        {
+            error = $"Too far ({dist:F1} yalms). Get within {puzzle.Start.SnapRadius:F0} yalms first.";
+            return false;
+        }
+
+        if (!mover.IsAvailable)
+        {
+            error = "Movement hook unavailable — update Signatures.RMIWalk.";
+            return false;
+        }
+
+        this.puzzle = puzzle;
+        locking     = false;
+        lockTimer   = 0f;
+        State       = PlayState.WalkingToStart;
+        log.Info("JumpPlayer: walking to start point.");
         return true;
     }
 
     public void Stop(string reason)
     {
         mover.ClearInjection();
-        State = PlayState.Idle;
+        locking   = false;
+        lockTimer = 0f;
+        State     = PlayState.Idle;
         log.Info($"JumpPlayer: stopped — {reason}");
     }
 
-    /// <summary>
-    /// Called every framework frame while playing or aligning.
-    /// </summary>
     public void Tick(float deltaMs, nint playerAddress, Vector3 playerPos)
     {
         switch (State)
         {
-            case PlayState.Aligning:
-                TickAlign(playerAddress, playerPos);
+            case PlayState.WalkingToStart:
+                TickWalkToStart(deltaMs, playerAddress, playerPos);
                 break;
 
             case PlayState.Playing:
@@ -113,25 +115,78 @@ public sealed unsafe class JumpPlayer
         }
     }
 
-    // ── State handlers ────────────────────────────────────────────────────────
+    // ── Walk to start ─────────────────────────────────────────────────────────
 
-    private void TickAlign(nint playerAddress, Vector3 playerPos)
+    private void TickWalkToStart(float deltaMs, nint playerAddress, Vector3 playerPos)
     {
-        // TODO: If distance > 0.5 yalms, issue vnavmesh.Path.MoveTo IPC call
-        //   var move = PluginInterface.GetIpcSubscriber<float, float, float, bool, object>("vnavmesh.Path.MoveTo");
-        //   move.InvokeAction(start.Position.X, start.Position.Y, start.Position.Z, false);
-        // For now, just snap facing and start immediately if close enough.
+        var   target = puzzle!.Start!.Position;
+        float dist   = Vector3.Distance(playerPos, target);
 
-        mover.SetPlayerFacing(playerAddress, puzzle!.Start!.Facing);
+        // Locking phase: hold exact position every frame until server confirms it
+        if (locking)
+        {
+            unsafe
+            {
+                var obj = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)playerAddress;
+                obj->Position = target;
+                obj->Rotation = puzzle.Start.Facing;
+            }
+            lockTimer += deltaMs;
+            if (lockTimer >= LockDurationMs)
+            {
+                locking = false;
+                State   = PlayState.Idle;
+                chat.Print("[JumpSolver] Locked to start point.");
+                log.Info("JumpPlayer: lock complete.");
+            }
+            return;
+        }
 
-        State     = PlayState.Playing;
+        // Close enough — snap and begin locking
+        if (dist <= WalkSnapRadius)
+        {
+            mover.ClearInjection();
+            locking   = true;
+            lockTimer = 0f;
+            unsafe
+            {
+                var obj = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)playerAddress;
+                obj->Position = target;
+                obj->Rotation = puzzle.Start.Facing;
+            }
+            log.Info($"JumpPlayer: snapped at dist={dist:F3}y, locking for {LockDurationMs}ms.");
+            return;
+        }
+
+        // Approach: scale speed proportionally so she decelerates smoothly into the target
+        // Full speed at WalkSlowRadius, 0.1× speed at WalkSnapRadius
+        float t     = Math.Clamp((dist - WalkSnapRadius) / (WalkSlowRadius - WalkSnapRadius), 0f, 1f);
+        float speed = MathF.Max(0.1f, t);
+
+        var   dir = Vector3.Normalize(target - playerPos);
+        float ang = MathF.Atan2(dir.X, dir.Z);
+        mover.SetPlayerFacing(playerAddress, ang);
+        mover.InjectedForward = speed;
+        mover.InjectedLeft    = 0f;
+    }
+
+    // ── Playback ──────────────────────────────────────────────────────────────
+
+    private void BeginSteps()
+    {
+        // Snap facing then begin step 0
+        var player = objects.LocalPlayer;
+        if (player != null)
+            mover.SetPlayerFacing(player.Address, puzzle!.Start!.Facing);
+
         StepIndex = 0;
         StepTimer = 0f;
         jumpFired = false;
         facingSet = false;
+        State     = PlayState.Playing;
 
-        chat.Print($"[JumpSolver] Running '{puzzle.Name}' — {puzzle.Steps.Count} steps.");
-        log.Info("JumpPlayer: alignment complete, starting steps.");
+        chat.Print($"[JumpSolver] Running '{puzzle!.Name}' — {puzzle.Steps.Count} steps.");
+        log.Info("JumpPlayer: playback started.");
     }
 
     private void TickStep(float deltaMs, nint playerAddress)
@@ -141,40 +196,36 @@ public sealed unsafe class JumpPlayer
             mover.ClearInjection();
             State = PlayState.Idle;
             chat.Print("[JumpSolver] Done!");
-            log.Info("JumpPlayer: playback complete.");
+            log.Info("JumpPlayer: complete.");
             return;
         }
 
         var step = puzzle.Steps[StepIndex];
 
-        // 1. Snap facing (once per step)
+        // 1. Snap facing once per step
         if (!facingSet)
         {
             mover.SetPlayerFacing(playerAddress, step.FacingAngle);
             facingSet = true;
-            log.Debug($"JumpPlayer: step {StepIndex + 1} — facing={step.FacingAngle:F2}");
         }
 
-        // 2. Hold forward movement
+        // 2. Hold forward
         mover.MoveForward();
 
-        // 3. Fire jump after delay
+        // 3. Fire jump at correct delay
         if (step.Jump && !jumpFired && StepTimer >= step.JumpDelayMs)
         {
-            FireJump(playerAddress);
+            FireJump();
             jumpFired = true;
         }
 
         StepTimer += deltaMs;
 
-        // 4. Advance when move duration elapsed
+        // 4. Advance when duration elapsed
         if (StepTimer >= step.MoveDurationMs)
         {
             mover.ClearInjection();
-
-            log.Debug($"JumpPlayer: step {StepIndex + 1} done " +
-                      $"(elapsed={StepTimer:F0}ms, jump={jumpFired}).");
-
+            log.Debug($"JumpPlayer: step {StepIndex + 1} done ({StepTimer:F0}ms).");
             StepIndex++;
             StepTimer = 0f;
             jumpFired = false;
@@ -184,15 +235,14 @@ public sealed unsafe class JumpPlayer
 
     // ── Jump ──────────────────────────────────────────────────────────────────
 
-    private void FireJump(nint playerAddress)
+    private void FireJump()
     {
         try
         {
-            // FFXIV General action 2 = Jump. Targeting self (0xE0000000 is the
-            // self sentinel for General actions — confirmed valid for non-targeted actions).
             var am = ActionManager.Instance();
             if (am == null) return;
-            am->UseAction(ActionType.General, Signatures.JumpActionId, 0xE0000000);
+            // ActionType 5 = GeneralAction. Jump is General Action ID 2.
+            am->UseAction((ActionType)5, Signatures.JumpActionId, 0xE0000000);
             log.Debug($"JumpPlayer: jump fired at step {StepIndex + 1}, t={StepTimer:F0}ms.");
         }
         catch (Exception ex)

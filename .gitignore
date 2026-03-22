@@ -2,6 +2,7 @@ src/bin/
 src/obj/
 dist/
 *.zip
+*.dll
 CLAUDE.md
 src/CLAUDE.md
 *.user

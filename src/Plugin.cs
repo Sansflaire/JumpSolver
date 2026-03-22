@@ -9,17 +9,6 @@ using Dalamud.Bindings.ImGui;
 
 namespace JumpSolver;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Plugin entry point
-//
-// Two authoring paths:
-//   A) Manual  — add steps in the UI, set FacingAngle from current player facing,
-//                tune move duration and jump delay with sliders
-//   B) Record  — toggle record, walk the puzzle yourself; each jump becomes a step
-//
-// Playback: /js play (or button) — aligns to start, runs all steps.
-// ──────────────────────────────────────────────────────────────────────────────
-
 public sealed class Plugin : IDalamudPlugin
 {
     // ── Dalamud services ──────────────────────────────────────────────────────
@@ -29,22 +18,26 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IChatGui               ChatGui         { get; private set; } = null!;
     [PluginService] internal static IClientState           ClientState     { get; private set; } = null!;
     [PluginService] internal static IObjectTable           ObjectTable     { get; private set; } = null!;
-    [PluginService] internal static IPlayerState           PlayerState     { get; private set; } = null!;
     [PluginService] internal static IFramework             Framework       { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider   GameInterop     { get; private set; } = null!;
+    [PluginService] internal static IGameGui               GameGui         { get; private set; } = null!;
 
     // ── Systems ───────────────────────────────────────────────────────────────
     private readonly MoveHook     mover;
     private readonly JumpRecorder recorder;
     private readonly JumpPlayer   player;
+    private readonly Configuration config;
 
     // ── Active puzzle ─────────────────────────────────────────────────────────
-    private readonly JumpPuzzle puzzle = new();
+    private JumpPuzzle puzzle = new();
 
-    // ── UI state ──────────────────────────────────────────────────────────────
+    // ── UI ────────────────────────────────────────────────────────────────────
     private bool showWindow   = false;
     private int  selectedStep = -1;
-    private int  activeTab    = 0;   // 0 = Manual, 1 = Recorded
+
+    // Save/load panel
+    private int    loadIndex   = -1;
+    private string saveName    = "";
 
     // ── Commands ──────────────────────────────────────────────────────────────
     private const string CmdMain = "/jumpsolver";
@@ -54,6 +47,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        config   = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         mover    = new MoveHook(GameInterop, Log);
         recorder = new JumpRecorder(Log);
         player   = new JumpPlayer(mover, ObjectTable, ChatGui, Log);
@@ -63,11 +57,11 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage =
                 "JumpSolver:\n" +
                 "  /js              – Toggle window\n" +
-                "  /js setstart     – Set start point to current position\n" +
-                "  /js record       – Start recording (walk puzzle yourself)\n" +
+                "  /js setstart     – Mark current position as start\n" +
+                "  /js gotostart    – Walk to start point\n" +
+                "  /js record       – Start recording\n" +
                 "  /js stop         – Stop recording / abort playback\n" +
-                "  /js play         – Run from start point\n" +
-                "  /js clear        – Wipe all recorded steps",
+                "  /js play         – Run from start point",
         });
         CommandManager.AddHandler(CmdJs, new CommandInfo(OnCommand) { ShowInHelp = false });
 
@@ -75,13 +69,13 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw       += DrawUI;
         PluginInterface.UiBuilder.OpenMainUi += () => showWindow = true;
 
-        Log.Info("JumpSolver loaded. /js for help.");
+        Log.Info("JumpSolver loaded.");
     }
 
     public void Dispose()
     {
-        if (recorder.State != RecordState.Idle)   recorder.StopRecording();
-        if (player.State   != PlayState.Idle)     player.Stop("plugin unloaded");
+        if (recorder.State != RecordState.Idle) recorder.StopRecording();
+        if (player.State   != PlayState.Idle)   player.Stop("unloaded");
 
         Framework.Update                     -= OnUpdate;
         PluginInterface.UiBuilder.Draw       -= DrawUI;
@@ -98,22 +92,20 @@ public sealed class Plugin : IDalamudPlugin
     {
         try
         {
-            var localPlayer = ObjectTable.LocalPlayer;
-            if (localPlayer == null) return;
+            var lp = ObjectTable.LocalPlayer;
+            if (lp == null) return;
 
             float dt = (float)fw.UpdateDelta.TotalMilliseconds;
 
-            // Recording tick
             if (recorder.State != RecordState.Idle)
-                recorder.Tick(dt, localPlayer.Position, localPlayer.Rotation);
+                recorder.Tick(dt, lp.Position, lp.Rotation);
 
-            // Playback tick
             if (player.State != PlayState.Idle)
-                player.Tick(dt, localPlayer.Address, localPlayer.Position);
+                player.Tick(dt, lp.Address, lp.Position);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "JumpSolver: exception in framework update.");
+            Log.Error(ex, "JumpSolver: framework update exception.");
         }
     }
 
@@ -123,15 +115,13 @@ public sealed class Plugin : IDalamudPlugin
     {
         switch (args.Trim().ToLowerInvariant())
         {
-            case "":         showWindow = !showWindow;  break;
-            case "setstart": CmdSetStart();             break;
-            case "record":   CmdRecord();               break;
-            case "stop":     CmdStop();                 break;
-            case "play":     CmdPlay();                 break;
-            case "clear":    CmdClear();                break;
-            default:
-                ChatGui.Print($"[JumpSolver] Unknown: {args}. Try /js for help.");
-                break;
+            case "":           showWindow = !showWindow;  break;
+            case "setstart":   CmdSetStart();             break;
+            case "gotostart":  CmdGotoStart();            break;
+            case "record":     CmdRecord();               break;
+            case "stop":       CmdStop();                 break;
+            case "play":       CmdPlay();                 break;
+            default: ChatGui.Print($"[JumpSolver] Unknown: {args}"); break;
         }
     }
 
@@ -143,6 +133,12 @@ public sealed class Plugin : IDalamudPlugin
         ChatGui.Print($"[JumpSolver] Start set at ({p.Position.X:F1}, {p.Position.Y:F1}, {p.Position.Z:F1}).");
     }
 
+    private void CmdGotoStart()
+    {
+        if (player.TryWalkToStart(puzzle, out var err)) return;
+        ChatGui.Print($"[JumpSolver] {err}");
+    }
+
     private void CmdRecord()
     {
         if (player.State != PlayState.Idle) { ChatGui.Print("[JumpSolver] Stop playback first."); return; }
@@ -152,8 +148,7 @@ public sealed class Plugin : IDalamudPlugin
         recorder.StartRecording(p.Position, p.Rotation);
         puzzle.Start = recorder.CapturedStart;
         puzzle.Steps.Clear();
-        activeTab = 1;
-        ChatGui.Print("[JumpSolver] Recording — walk your puzzle now. /js stop when done.");
+        ChatGui.Print("[JumpSolver] Recording — walk your puzzle. /js stop when done.");
     }
 
     private void CmdStop()
@@ -161,56 +156,81 @@ public sealed class Plugin : IDalamudPlugin
         if (recorder.State != RecordState.Idle)
         {
             recorder.StopRecording();
-            // Merge recorded steps into puzzle
             puzzle.Steps.Clear();
             puzzle.Steps.AddRange(recorder.CompletedSteps);
             ChatGui.Print($"[JumpSolver] Recorded {puzzle.Steps.Count} steps.");
         }
         else if (player.State != PlayState.Idle)
         {
-            player.Stop("aborted by user");
-            ChatGui.Print("[JumpSolver] Playback aborted.");
-        }
-        else
-        {
-            ChatGui.Print("[JumpSolver] Nothing to stop.");
+            player.Stop("aborted");
+            ChatGui.Print("[JumpSolver] Stopped.");
         }
     }
 
     private void CmdPlay()
     {
         if (recorder.State != RecordState.Idle) { ChatGui.Print("[JumpSolver] Stop recording first."); return; }
-        if (player.TryStart(puzzle, out var error)) return;
-        ChatGui.Print($"[JumpSolver] {error}");
+        if (player.TryStart(puzzle, out var err)) return;
+        ChatGui.Print($"[JumpSolver] {err}");
     }
 
-    private void CmdClear()
+    // ── Save / Load ───────────────────────────────────────────────────────────
+
+    private void SavePuzzle()
     {
-        CmdStop();
-        puzzle.Steps.Clear();
-        puzzle.Start = null;
-        recorder.ClearAll();
+        string name = string.IsNullOrWhiteSpace(saveName) ? puzzle.Name : saveName;
+        puzzle.Name = name;
+
+        // Replace existing or add new
+        int idx = config.SavedPuzzles.FindIndex(p => p.Name == name);
+        if (idx >= 0)
+            config.SavedPuzzles[idx] = puzzle.DeepCopy();
+        else
+            config.SavedPuzzles.Add(puzzle.DeepCopy());
+
+        PluginInterface.SavePluginConfig(config);
+        ChatGui.Print($"[JumpSolver] Saved '{name}'.");
+    }
+
+    private void LoadPuzzle(int idx)
+    {
+        if (idx < 0 || idx >= config.SavedPuzzles.Count) return;
+        puzzle = config.SavedPuzzles[idx].DeepCopy();
         selectedStep = -1;
-        ChatGui.Print("[JumpSolver] Cleared.");
+        ChatGui.Print($"[JumpSolver] Loaded '{puzzle.Name}'.");
+    }
+
+    private void DeleteSavedPuzzle(int idx)
+    {
+        if (idx < 0 || idx >= config.SavedPuzzles.Count) return;
+        string name = config.SavedPuzzles[idx].Name;
+        config.SavedPuzzles.RemoveAt(idx);
+        PluginInterface.SavePluginConfig(config);
+        if (loadIndex >= config.SavedPuzzles.Count) loadIndex = config.SavedPuzzles.Count - 1;
+        ChatGui.Print($"[JumpSolver] Deleted '{name}'.");
     }
 
     // ── UI ────────────────────────────────────────────────────────────────────
 
     private void DrawUI()
     {
+        // Always draw world marker regardless of window state
+        DrawWorldMarker();
+
         if (!showWindow) return;
 
-        ImGui.SetNextWindowSize(new Vector2(500, 580), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("JumpSolver", ref showWindow, ImGuiWindowFlags.None))
-        { ImGui.End(); return; }
+        ImGui.SetNextWindowSize(new Vector2(520, 600), ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("JumpSolver", ref showWindow)) { ImGui.End(); return; }
 
         DrawHeader();
         ImGui.Separator();
         DrawStartSection();
         ImGui.Separator();
-        DrawTabBar();
+        DrawStepList();
         ImGui.Separator();
         DrawPlaybackBar();
+        ImGui.Separator();
+        DrawSaveLoadSection();
 
         ImGui.End();
     }
@@ -221,174 +241,170 @@ public sealed class Plugin : IDalamudPlugin
     {
         ImGui.TextColored(new Vector4(0.18f, 0.80f, 0.44f, 1f), "JumpSolver");
         ImGui.SameLine();
-
-        // Status badge
-        var (stateText, stateColor) = GetStateDisplay();
-        ImGui.TextColored(stateColor, $"[{stateText}]");
-
+        var (txt, col) = GetStateLabel();
+        ImGui.TextColored(col, $"[{txt}]");
         if (!mover.IsAvailable)
         {
             ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1f, 0.4f, 0.2f, 1f), "⚠ hook failed");
+            ImGui.TextColored(new Vector4(1f, 0.4f, 0.2f, 1f), "⚠ hook unavailable");
         }
 
-        ImGui.Spacing();
         var name = puzzle.Name;
-        ImGui.SetNextItemWidth(250);
-        if (ImGui.InputText("##puzzlename", ref name, 80))
-            puzzle.Name = name;
-        ImGui.SameLine();
-        ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f), "puzzle name");
+        ImGui.SetNextItemWidth(260);
+        if (ImGui.InputText("##pname", ref name, 80)) puzzle.Name = name;
     }
 
-    private (string text, Vector4 color) GetStateDisplay()
+    private (string, Vector4) GetStateLabel()
     {
         if (player.State == PlayState.Playing)
             return ($"PLAYING {player.StepIndex + 1}/{puzzle.Steps.Count}", new Vector4(0.3f, 0.8f, 1f, 1f));
-        if (player.State == PlayState.Aligning)
-            return ("ALIGNING", new Vector4(1f, 0.8f, 0.2f, 1f));
+        if (player.State == PlayState.WalkingToStart)
+            return ("WALKING TO START", new Vector4(1f, 0.85f, 0.2f, 1f));
         if (recorder.State != RecordState.Idle)
-            return ($"REC {recorder.State} +{recorder.CompletedSteps.Count}", new Vector4(1f, 0.3f, 0.3f, 1f));
+            return ($"REC [{recorder.State}] +{recorder.CompletedSteps.Count}", new Vector4(1f, 0.3f, 0.3f, 1f));
         return ("idle", new Vector4(0.5f, 0.5f, 0.5f, 1f));
     }
 
-    // ── Start point ───────────────────────────────────────────────────────────
+    // ── Start section ─────────────────────────────────────────────────────────
 
     private void DrawStartSection()
     {
         ImGui.Text("Start Point");
         ImGui.SameLine();
-        if (ImGui.SmallButton("Set Here##start"))
-            CmdSetStart();
+        if (ImGui.SmallButton("Set Here")) CmdSetStart();
+        ImGui.SameLine();
+
+        bool canGo = puzzle.Start != null && player.State == PlayState.Idle && mover.IsAvailable;
+        if (!canGo) ImGui.BeginDisabled();
+        if (ImGui.SmallButton("Go To Start")) CmdGotoStart();
+        if (!canGo) ImGui.EndDisabled();
 
         if (puzzle.Start != null)
         {
             var s = puzzle.Start;
-            ImGui.TextColored(new Vector4(0.65f, 0.65f, 0.65f, 1f),
-                $"  ({s.Position.X:F1}, {s.Position.Y:F1}, {s.Position.Z:F1})   facing {s.Facing:F2} rad");
-            ImGui.SetNextItemWidth(160);
+            var lp = ObjectTable.LocalPlayer;
+            float dist = lp != null ? Vector3.Distance(lp.Position, s.Position) : float.MaxValue;
+
+            var distCol = dist < 0.5f   ? new Vector4(0.3f, 1f, 0.3f, 1f)
+                        : dist < s.SnapRadius ? new Vector4(1f, 1f, 0.3f, 1f)
+                        :                       new Vector4(0.65f, 0.65f, 0.65f, 1f);
+
+            ImGui.TextColored(distCol,
+                $"  ({s.Position.X:F1}, {s.Position.Y:F1}, {s.Position.Z:F1})  " +
+                $"facing {s.Facing:F2}r   dist {dist:F1}y");
+
             float snap = s.SnapRadius;
-            if (ImGui.SliderFloat("snap radius (yalms)##snap", ref snap, 1f, 20f))
-                s.SnapRadius = snap;
+            ImGui.SetNextItemWidth(160);
+            if (ImGui.SliderFloat("snap radius##snap", ref snap, 1f, 30f)) s.SnapRadius = snap;
         }
         else
         {
-            ImGui.TextColored(new Vector4(1f, 0.65f, 0.2f, 1f),
-                "  Not set — stand at puzzle start and click Set Here.");
+            ImGui.TextColored(new Vector4(1f, 0.65f, 0.2f, 1f), "  Not set.");
         }
     }
 
-    // ── Tab bar: Manual / Recorded ────────────────────────────────────────────
+    // ── Step list ─────────────────────────────────────────────────────────────
 
-    private void DrawTabBar()
+    private void DrawStepList()
     {
-        if (ImGui.BeginTabBar("##modes"))
-        {
-            if (ImGui.BeginTabItem("Manual"))
-            {
-                activeTab = 0;
-                DrawManualTab();
-                ImGui.EndTabItem();
-            }
-            if (ImGui.BeginTabItem("Recorded"))
-            {
-                activeTab = 1;
-                DrawRecordedTab();
-                ImGui.EndTabItem();
-            }
-            ImGui.EndTabBar();
-        }
-    }
+        bool isRec = recorder.State != RecordState.Idle;
 
-    // ── Manual tab ────────────────────────────────────────────────────────────
-
-    private void DrawManualTab()
-    {
-        ImGui.Spacing();
-
-        // Step list
         ImGui.Text($"Steps ({puzzle.Steps.Count})");
         ImGui.SameLine();
-        if (ImGui.SmallButton("+ Add##manual"))
+
+        if (!isRec)
         {
-            var facing = ObjectTable.LocalPlayer?.Rotation ?? 0f;
-            puzzle.Steps.Add(new JumpStep(facing, 700f, true, 0f));
-            selectedStep = puzzle.Steps.Count - 1;
+            if (ImGui.SmallButton("+ Add"))
+            {
+                float facing = ObjectTable.LocalPlayer?.Rotation ?? 0f;
+                puzzle.Steps.Add(new JumpStep(facing, 700f, false, 0f));
+                selectedStep = puzzle.Steps.Count - 1;
+            }
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Record"))  CmdRecord();
+        }
+        else
+        {
+            ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f),
+                $"● REC  {recorder.CompletedSteps.Count} steps");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Stop Rec")) CmdStop();
         }
 
-        ImGui.BeginChild("##manuallist", new Vector2(0, 160), true);
-        for (int i = 0; i < puzzle.Steps.Count; i++)
-            DrawStepRow(i);
+        // Step rows
+        ImGui.BeginChild("##steps", new Vector2(0, 170), true);
+
+        var displaySteps = isRec ? recorder.CompletedSteps : puzzle.Steps;
+        for (int i = 0; i < displaySteps.Count; i++)
+        {
+            var step = displaySteps[i];
+            bool isCurrent = player.State == PlayState.Playing && i == player.StepIndex;
+            bool isSel     = !isRec && i == selectedStep;
+
+            var col = isCurrent ? new Vector4(0.18f, 0.80f, 0.44f, 1f)
+                    : isSel     ? new Vector4(0.85f, 0.85f, 1f, 1f)
+                    :             new Vector4(0.70f, 0.70f, 0.70f, 1f);
+
+            ImGui.TextColored(col,
+                $"{i + 1:D2}. {step.FacingAngle,6:F2}r  {step.MoveDurationMs,6:F0}ms" +
+                (step.Jump ? $"  J+{step.JumpDelayMs:F0}ms" : ""));
+
+            if (!isRec && ImGui.IsItemClicked()) selectedStep = i;
+
+            // Delete button per row
+            if (!isRec)
+            {
+                ImGui.SameLine();
+                ImGui.PushID(i);
+                if (ImGui.SmallButton("✕"))
+                {
+                    puzzle.Steps.RemoveAt(i);
+                    if (selectedStep >= puzzle.Steps.Count)
+                        selectedStep = puzzle.Steps.Count - 1;
+                    ImGui.PopID();
+                    break; // avoid iterating invalidated list
+                }
+                ImGui.PopID();
+            }
+        }
+
         ImGui.EndChild();
 
-        // Editor
-        if (selectedStep >= 0 && selectedStep < puzzle.Steps.Count)
+        // Editor for selected step
+        if (!isRec && selectedStep >= 0 && selectedStep < puzzle.Steps.Count)
             DrawStepEditor(puzzle.Steps[selectedStep]);
-    }
-
-    private void DrawStepRow(int i)
-    {
-        var step = puzzle.Steps[i];
-        bool isCurrent = player.State == PlayState.Playing && i == player.StepIndex;
-        bool isSelected = i == selectedStep;
-
-        var color = isCurrent  ? new Vector4(0.18f, 0.80f, 0.44f, 1f)
-                  : isSelected ? new Vector4(0.85f, 0.85f, 1f, 1f)
-                  :              new Vector4(0.70f, 0.70f, 0.70f, 1f);
-
-        ImGui.TextColored(color,
-            $"{i + 1:D2}. facing {step.FacingAngle,6:F2}r   {step.MoveDurationMs,5:F0}ms" +
-            (step.Jump ? $"  J+{step.JumpDelayMs:F0}ms" : "  (no jump)"));
-
-        if (ImGui.IsItemClicked()) selectedStep = i;
     }
 
     private void DrawStepEditor(JumpStep step)
     {
         ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
         ImGui.TextColored(new Vector4(0.85f, 0.85f, 1f, 1f), $"Step {selectedStep + 1}");
 
-        // Facing angle
-        float facing = step.FacingAngle;
+        float f = step.FacingAngle;
         ImGui.SetNextItemWidth(180);
-        if (ImGui.SliderFloat("Facing (rad)##f", ref facing, -MathF.PI, MathF.PI))
-            step.FacingAngle = facing;
+        if (ImGui.SliderFloat("Facing (rad)##f", ref f, -MathF.PI, MathF.PI)) step.FacingAngle = f;
         ImGui.SameLine();
-        if (ImGui.SmallButton("← Player"))
+        if (ImGui.SmallButton("← From Player"))
         {
             var p = ObjectTable.LocalPlayer;
             if (p != null) step.FacingAngle = p.Rotation;
         }
 
-        // Move duration
-        float dur = step.MoveDurationMs;
+        float d = step.MoveDurationMs;
         ImGui.SetNextItemWidth(180);
-        if (ImGui.SliderFloat("Move (ms)##d", ref dur, 50f, 3000f))
-            step.MoveDurationMs = dur;
+        if (ImGui.SliderFloat("Move (ms)##d", ref d, 50f, 4000f)) step.MoveDurationMs = d;
 
-        // Jump
-        bool doJump = step.Jump;
-        if (ImGui.Checkbox("Jump##j", ref doJump)) step.Jump = doJump;
-
+        bool j = step.Jump;
+        if (ImGui.Checkbox("Jump##j", ref j)) step.Jump = j;
         if (step.Jump)
         {
             ImGui.SameLine();
-            float jdelay = step.JumpDelayMs;
+            float jd = step.JumpDelayMs;
             ImGui.SetNextItemWidth(180);
-            if (ImGui.SliderFloat("Jump delay (ms)##jd", ref jdelay, 0f, step.MoveDurationMs))
-                step.JumpDelayMs = jdelay;
+            if (ImGui.SliderFloat("Delay (ms)##jd", ref jd, 0f, step.MoveDurationMs)) step.JumpDelayMs = jd;
         }
 
-        // Actions
         ImGui.Spacing();
-        if (ImGui.SmallButton("Remove##rm"))
-        {
-            puzzle.Steps.RemoveAt(selectedStep);
-            selectedStep = Math.Clamp(selectedStep - 1, -1, puzzle.Steps.Count - 1);
-        }
-        ImGui.SameLine();
         if (ImGui.SmallButton("Duplicate##dup"))
         {
             puzzle.Steps.Insert(selectedStep + 1, step.Clone());
@@ -410,85 +426,143 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    // ── Recorded tab ──────────────────────────────────────────────────────────
-
-    private void DrawRecordedTab()
-    {
-        ImGui.Spacing();
-
-        // Recording controls
-        if (recorder.State == RecordState.Idle)
-        {
-            if (ImGui.Button("Start Recording"))   CmdRecord();
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f), "Walk your puzzle — each jump is captured.");
-        }
-        else
-        {
-            ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f),
-                $"● REC  [{recorder.State}]  {recorder.CompletedSteps.Count} steps");
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Stop##recstop")) CmdStop();
-        }
-
-        ImGui.Spacing();
-
-        // Live step list from recorder
-        var steps = recorder.State != RecordState.Idle ? recorder.CompletedSteps : puzzle.Steps;
-        ImGui.Text($"Captured steps: {steps.Count}");
-        ImGui.BeginChild("##reclist", new Vector2(0, 200), true);
-        for (int i = 0; i < steps.Count; i++)
-        {
-            var step = steps[i];
-            bool isCurrent = player.State == PlayState.Playing && i == player.StepIndex;
-            var color = isCurrent ? new Vector4(0.18f, 0.80f, 0.44f, 1f)
-                                  : new Vector4(0.70f, 0.70f, 0.70f, 1f);
-            ImGui.TextColored(color,
-                $"{i + 1:D2}. facing {step.FacingAngle,6:F2}r   " +
-                $"move {step.MoveDurationMs,5:F0}ms   J+{step.JumpDelayMs:F0}ms");
-        }
-        ImGui.EndChild();
-
-        if (recorder.State == RecordState.Idle && puzzle.Steps.Count > 0)
-        {
-            ImGui.Spacing();
-            if (ImGui.SmallButton("Re-record"))
-            {
-                puzzle.Steps.Clear();
-                CmdRecord();
-            }
-        }
-    }
-
     // ── Playback bar ──────────────────────────────────────────────────────────
 
     private void DrawPlaybackBar()
     {
         ImGui.Spacing();
+        bool active = player.State != PlayState.Idle;
+        bool isRec  = recorder.State != RecordState.Idle;
 
-        bool isPlaying = player.State != PlayState.Idle;
-        bool isRecording = recorder.State != RecordState.Idle;
-
-        if (!isPlaying && !isRecording)
+        if (!active && !isRec)
         {
             bool canPlay = puzzle.Start != null && puzzle.Steps.Count > 0;
             if (!canPlay) ImGui.BeginDisabled();
             if (ImGui.Button("▶ Play"))  CmdPlay();
             if (!canPlay) ImGui.EndDisabled();
-
-            ImGui.SameLine();
-            if (ImGui.Button("✕ Clear")) CmdClear();
         }
-        else
+        else if (!isRec)
         {
-            if (ImGui.Button("■ Stop"))  CmdStop();
-
+            if (ImGui.Button("■ Stop")) CmdStop();
             if (player.State == PlayState.Playing)
             {
                 ImGui.SameLine();
                 ImGui.TextColored(new Vector4(0.18f, 0.80f, 0.44f, 1f),
-                    $"Step {player.StepIndex + 1} / {puzzle.Steps.Count}   t={player.StepTimer:F0}ms");
+                    $"Step {player.StepIndex + 1}/{puzzle.Steps.Count}  {player.StepTimer:F0}ms");
             }
         }
+        ImGui.Spacing();
+    }
+
+    // ── Save / Load section ───────────────────────────────────────────────────
+
+    private void DrawSaveLoadSection()
+    {
+        ImGui.Text("Puzzles");
+        ImGui.Spacing();
+
+        // Save current puzzle
+        ImGui.SetNextItemWidth(200);
+        ImGui.InputText("##savename", ref saveName, 80);
+        ImGui.SameLine();
+        if (ImGui.Button("Save"))
+        {
+            if (string.IsNullOrWhiteSpace(saveName)) saveName = puzzle.Name;
+            SavePuzzle();
+        }
+
+        ImGui.Spacing();
+
+        if (config.SavedPuzzles.Count == 0)
+        {
+            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f), "No saved puzzles.");
+            return;
+        }
+
+        ImGui.BeginChild("##savedlist", new Vector2(0, 120), true);
+        for (int i = 0; i < config.SavedPuzzles.Count; i++)
+        {
+            var p    = config.SavedPuzzles[i];
+            bool sel = i == loadIndex;
+
+            if (ImGui.Selectable($"{p.Name}  ({p.Steps.Count} steps)##sl{i}", sel))
+                loadIndex = i;
+
+            ImGui.SameLine();
+            ImGui.PushID(10000 + i);
+            if (ImGui.SmallButton("Load"))  { LoadPuzzle(i); loadIndex = i; }
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Del"))   DeleteSavedPuzzle(i);
+            ImGui.PopID();
+        }
+        ImGui.EndChild();
+    }
+
+    // ── World-space start marker ──────────────────────────────────────────────
+
+    private void DrawWorldMarker()
+    {
+        if (puzzle.Start == null) return;
+
+        var lp = ObjectTable.LocalPlayer;
+        var s  = puzzle.Start;
+
+        float dist = lp != null ? Vector3.Distance(lp.Position, s.Position) : float.MaxValue;
+        bool onPoint = dist < 0.35f;
+        bool inRange = dist <= s.SnapRadius;
+
+        // Facing match (only relevant when on-point)
+        bool correctFacing = onPoint && lp != null &&
+                             MathF.Abs(AngleDiff(lp.Rotation, s.Facing)) < 0.15f;
+
+        uint colFill, colRing;
+        if (correctFacing)      { colFill = Color(0.1f, 1f, 0.1f, 0.85f); colRing = Color(0.1f, 1f, 0.1f, 0.5f); }
+        else if (inRange)       { colFill = Color(1f, 1f, 0.1f, 0.85f);   colRing = Color(1f, 1f, 0.1f, 0.4f); }
+        else                    { colFill = Color(1f, 0.2f, 0.2f, 0.85f); colRing = Color(1f, 0.2f, 0.2f, 0.3f); }
+
+        var dl = ImGui.GetForegroundDrawList();
+
+        // Centre dot
+        if (GameGui.WorldToScreen(s.Position, out var centre))
+        {
+            dl.AddCircleFilled(centre, 7f, colFill);
+            dl.AddCircle(centre, 7f, Color(0f, 0f, 0f, 0.6f), 16, 1.5f);
+
+            // Facing direction line
+            var facingDir = new Vector3(MathF.Sin(s.Facing), 0f, MathF.Cos(s.Facing));
+            var facingTip = s.Position + facingDir * 1.5f;
+            if (GameGui.WorldToScreen(facingTip, out var tipScreen))
+                dl.AddLine(centre, tipScreen, colFill, 2f);
+        }
+
+        // Snap radius ring (32 segments on the XZ plane)
+        const int Seg = 32;
+        Vector2?  prev = null;
+        for (int i = 0; i <= Seg; i++)
+        {
+            float ang = i * MathF.PI * 2f / Seg;
+            var   wp  = s.Position + new Vector3(MathF.Sin(ang) * s.SnapRadius, 0f,
+                                                  MathF.Cos(ang) * s.SnapRadius);
+            if (GameGui.WorldToScreen(wp, out var sp))
+            {
+                if (prev.HasValue)
+                    dl.AddLine(prev.Value, sp, colRing, 1.5f);
+                prev = sp;
+            }
+            else prev = null;
+        }
+    }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+
+    private static uint Color(float r, float g, float b, float a)
+        => ImGui.GetColorU32(new Vector4(r, g, b, a));
+
+    private static float AngleDiff(float a, float b)
+    {
+        float d = a - b;
+        while (d >  MathF.PI) d -= MathF.PI * 2f;
+        while (d < -MathF.PI) d += MathF.PI * 2f;
+        return d;
     }
 }

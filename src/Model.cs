@@ -6,26 +6,30 @@ namespace JumpSolver;
 // ──────────────────────────────────────────────────────────────────────────────
 // JumpStep
 //
-// One authored step. Playback:
+// One recorded or authored step. Playback sequence per step:
 //   1. Snap player facing to FacingAngle
 //   2. Hold "move forward" for MoveDurationMs milliseconds
-//   3. If Jump == true, fire jump after JumpDelayMs milliseconds
+//   3. If Jump == true, fire jump after JumpDelayMs milliseconds from move start
 //
-// FacingAngle is an absolute world-space angle in radians (-π..π).
-// During recording it is captured from player.Rotation at the moment
-// the jump input is detected. During manual authoring it is set to the
-// player's current facing when the user clicks "Set Facing Here".
+// MoveDurationMs covers the FULL step including time in the air — keep holding
+// forward through the jump. The step ends when MoveDurationMs elapses, which
+// should correspond to roughly when the player lands.
+//
+// During recording, each step boundary is one of:
+//   • Direction change (rotation shifts > threshold while walking)
+//   • Landing after a jump
+//   • Player stops moving without jumping
 // ──────────────────────────────────────────────────────────────────────────────
 public sealed class JumpStep
 {
-    public float FacingAngle   { get; set; }        // radians, world-space
-    public float MoveDurationMs { get; set; } = 700f; // how long to hold forward
-    public bool  Jump          { get; set; } = true;
-    public float JumpDelayMs   { get; set; } = 0f;   // ms after move starts before jump fires
+    public float FacingAngle    { get; set; }          // radians, world-space (-π..π)
+    public float MoveDurationMs { get; set; } = 700f;  // hold forward this long
+    public bool  Jump           { get; set; } = false;
+    public float JumpDelayMs    { get; set; } = 0f;    // ms after move starts before jump fires
 
     public JumpStep() { }
 
-    public JumpStep(float facingAngle, float moveDurationMs, bool jump = true, float jumpDelayMs = 0f)
+    public JumpStep(float facingAngle, float moveDurationMs, bool jump = false, float jumpDelayMs = 0f)
     {
         FacingAngle    = facingAngle;
         MoveDurationMs = moveDurationMs;
@@ -38,26 +42,34 @@ public sealed class JumpStep
 
 // ──────────────────────────────────────────────────────────────────────────────
 // StartPoint
-//
-// The exact position and facing the player must be at before playback begins.
-// If the player is within SnapRadius yalms, the plugin walks them to the
-// exact position and snaps their rotation before executing steps.
 // ──────────────────────────────────────────────────────────────────────────────
 public sealed class StartPoint
 {
     public Vector3 Position   { get; set; }
-    public float   Facing     { get; set; }   // radians, world-space
+    public float   Facing     { get; set; }   // radians
     public float   SnapRadius { get; set; } = 5f;
+
+    public StartPoint Clone() => new()
+    {
+        Position   = Position,
+        Facing     = Facing,
+        SnapRadius = SnapRadius,
+    };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // JumpPuzzle
-//
-// A named, shareable puzzle solution. Serialised to pluginConfigs/JumpSolver.json.
 // ──────────────────────────────────────────────────────────────────────────────
 public sealed class JumpPuzzle
 {
     public string         Name  { get; set; } = "New Puzzle";
     public StartPoint?    Start { get; set; }
     public List<JumpStep> Steps { get; set; } = new();
+
+    public JumpPuzzle DeepCopy()
+    {
+        var copy = new JumpPuzzle { Name = Name, Start = Start?.Clone() };
+        foreach (var s in Steps) copy.Steps.Add(s.Clone());
+        return copy;
+    }
 }

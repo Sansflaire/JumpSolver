@@ -1,0 +1,74 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download Dalamud
+        run: |
+          Invoke-WebRequest -Uri "https://goatcorp.github.io/dalamud-distrib/stg/latest.zip" -OutFile dalamud.zip
+          Expand-Archive -Path dalamud.zip -DestinationPath "$env:APPDATA\XIVLauncher\addon\Hooks\dev" -Force
+        shell: pwsh
+
+      - name: Get version
+        id: version
+        run: |
+          $version = (Select-Xml -Path "src/JumpSolver.csproj" -XPath "//Version").Node.InnerText
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Build
+        run: dotnet build src/JumpSolver.csproj -c Release
+        shell: pwsh
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "src/bin/x64/Release/JumpSolver.dll" -Destination dist/
+          Copy-Item "JumpSolver.json" -Destination dist/
+          Compress-Archive -Path dist/* -DestinationPath JumpSolver.zip -Force
+        shell: pwsh
+
+      - name: Update pluginmaster.json version
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $json = @(Get-Content pluginmaster.json | ConvertFrom-Json)
+          $json[0].AssemblyVersion = $version
+          $json[0].TestingAssemblyVersion = $version
+          $json | ConvertTo-Json -Depth 10 -AsArray | Set-Content pluginmaster.json
+        shell: pwsh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: v${{ steps.version.outputs.VERSION }}
+          files: JumpSolver.zip
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit updated pluginmaster.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git diff --staged --quiet || git commit -m "ci: update pluginmaster.json to v${{ steps.version.outputs.VERSION }}"
+          git push
+        shell: pwsh

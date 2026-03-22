@@ -1,0 +1,14 @@
+{
+    "Author": "Sansflaire",
+    "Name": "JumpSolver",
+    "InternalName": "JumpSolver",
+    "Punchline": "Record and replay jump puzzle solutions automatically.",
+    "Description": "JumpSolver records a sequence of jumps in any player-made jump puzzle, then replays them with automated movement and jump inputs so anyone can solve the puzzle hands-free.",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 14,
+    "Tags": [
+        "utility",
+        "automation",
+        "puzzle"
+    ]
+}

@@ -1,0 +1,8 @@
+src/bin/
+src/obj/
+dist/
+*.zip
+CLAUDE.md
+src/CLAUDE.md
+*.user
+.vs/

@@ -1,0 +1,27 @@
+[
+  {
+    "Author": "Sansflaire",
+    "Name": "JumpSolver",
+    "InternalName": "JumpSolver",
+    "AssemblyVersion": "0.1.0.0",
+    "TestingAssemblyVersion": "0.1.0.0",
+    "Punchline": "Record and replay jump puzzle solutions automatically.",
+    "Description": "JumpSolver records a sequence of jumps in any player-made jump puzzle, then replays them with automated movement and jump inputs so anyone can solve the puzzle hands-free. Supports manual step authoring and path recording.",
+    "RepoUrl": "https://github.com/Sansflaire/JumpSolver",
+    "Tags": [
+      "utility",
+      "automation",
+      "puzzle"
+    ],
+    "CategoryTags": [
+      "Utility"
+    ],
+    "DalamudApiLevel": 14,
+    "ApplicableVersion": "any",
+    "DownloadLinkInstall": "https://github.com/Sansflaire/JumpSolver/releases/latest/download/JumpSolver.zip",
+    "DownloadLinkUpdate": "https://github.com/Sansflaire/JumpSolver/releases/latest/download/JumpSolver.zip",
+    "DownloadLinkTesting": "https://github.com/Sansflaire/JumpSolver/releases/latest/download/JumpSolver.zip",
+    "IsHide": false,
+    "IsTestingExclusive": false
+  }
+]

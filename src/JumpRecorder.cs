@@ -11,22 +11,14 @@ public enum RecordState { Idle, Recording }
 
 internal sealed class JumpRecorder
 {
-    // ── Detection thresholds ──────────────────────────────────────────────────
-    private const float AirborneYDelta    = 0.05f;   // Y rise/sample = jumped
-    private const float PlantedThreshold  = 0.004f;
-    private const int   MinGroundedFrames = 4;
-    private const int   PostJumpLockoutTicks = 20;
-
     // ── Public state ──────────────────────────────────────────────────────────
     public RecordState         State          { get; private set; } = RecordState.Idle;
     public List<RecordedFrame> CapturedFrames { get; private set; } = new();
 
     // ── Frame tracking ────────────────────────────────────────────────────────
-    private bool  prevRising        = false;
-    private float prevY             = 0f;
-    private bool  jumpInAir         = false;
-    private int   groundedFrameCount = 0;
-    private int   postJumpLockout   = 0;
+    // Jump detection uses spacebar edge (pressed this frame, not last frame).
+    // This is exact — Y-delta inference fires 1–3 frames late.
+    private bool prevKeySpace = false;
 
     private readonly IPluginLog log;
 
@@ -37,12 +29,8 @@ internal sealed class JumpRecorder
     public void StartRecording(Vector3 pos, float facing)
     {
         CapturedFrames.Clear();
-        prevY              = pos.Y;
-        prevRising         = false;
-        jumpInAir          = false;
-        groundedFrameCount = 0;
-        postJumpLockout    = 0;
-        State              = RecordState.Recording;
+        prevKeySpace = false;
+        State        = RecordState.Recording;
         log.Info("JumpRecorder: recording started.");
     }
 
@@ -59,37 +47,31 @@ internal sealed class JumpRecorder
         CapturedFrames.Clear();
     }
 
-    public void Tick(float deltaMs, Vector3 pos, float facing, float sumForward = 0f, float sumLeft = 0f)
+    public void Tick(float deltaMs, Vector3 pos, float facing,
+                     float sumForward = 0f, float sumLeft = 0f, bool keySpace = false,
+                     float cameraYaw = 0f, float cameraPitch = 0f)
     {
         if (State != RecordState.Recording) return;
 
-        float yDelta  = pos.Y - prevY;
-        bool  rising  = yDelta > AirborneYDelta;
-
-        if (jumpInAir)
-        {
-            if (MathF.Abs(yDelta) < PlantedThreshold) groundedFrameCount++;
-            else                                       groundedFrameCount = 0;
-            if (groundedFrameCount >= MinGroundedFrames) { jumpInAir = false; groundedFrameCount = 0; }
-        }
-        if (postJumpLockout > 0) postJumpLockout--;
-
-        bool jumpFire = rising && !prevRising && !jumpInAir && postJumpLockout == 0;
-        if (jumpFire) { jumpInAir = true; groundedFrameCount = 0; postJumpLockout = PostJumpLockoutTicks; }
+        // Fire jump on the exact frame Space is first pressed (edge detection).
+        // Y-delta inference fires 1–3 frames late and can double-trigger.
+        bool jumpFire = keySpace && !prevKeySpace;
 
         CapturedFrames.Add(new RecordedFrame
         {
-            DeltaMs    = deltaMs,
-            Facing     = facing,
-            PosX       = pos.X,
-            PosZ       = pos.Z,
-            Moving     = sumForward != 0f || sumLeft != 0f,
-            Jump       = jumpFire,
-            SumForward = sumForward,
-            SumLeft    = sumLeft,
+            DeltaMs     = deltaMs,
+            Facing      = facing,
+            PosX        = pos.X,
+            PosY        = pos.Y,
+            PosZ        = pos.Z,
+            Moving      = sumForward != 0f || sumLeft != 0f,
+            Jump        = jumpFire,
+            SumForward  = sumForward,
+            SumLeft     = sumLeft,
+            CameraYaw   = cameraYaw,
+            CameraPitch = cameraPitch,
         });
 
-        prevY      = pos.Y;
-        prevRising = rising;
+        prevKeySpace = keySpace;
     }
 }

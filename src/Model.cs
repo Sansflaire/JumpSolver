@@ -13,14 +13,17 @@ namespace JumpSolver;
 // ─────────────────────────────────────────────────────────────────────────────
 public sealed class RecordedFrame
 {
-    public float DeltaMs    { get; set; }
-    public float Facing     { get; set; }
-    public float PosX       { get; set; }
-    public float PosZ       { get; set; }
-    public bool  Moving     { get; set; }   // backward-compat with old saves
-    public bool  Jump       { get; set; }
-    public float SumForward { get; set; }   // raw RMI — replayed exactly
-    public float SumLeft    { get; set; }   // raw RMI — replayed exactly
+    public float DeltaMs     { get; set; }
+    public float Facing      { get; set; }
+    public float PosX        { get; set; }
+    public float PosY        { get; set; }   // world-space Y — used for terrain step detection
+    public float PosZ        { get; set; }
+    public bool  Moving      { get; set; }   // backward-compat with old saves
+    public bool  Jump        { get; set; }
+    public float SumForward  { get; set; }   // raw RMI — replayed exactly
+    public float SumLeft     { get; set; }   // raw RMI — replayed exactly
+    public float CameraYaw   { get; set; }   // DirH — replayed each frame
+    public float CameraPitch { get; set; }   // DirV — replayed each frame
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39,10 +42,11 @@ public sealed class PuzzleSegment
         foreach (var f in Frames)
             copy.Frames.Add(new RecordedFrame
             {
-                DeltaMs    = f.DeltaMs, Facing  = f.Facing,
-                PosX       = f.PosX,   PosZ    = f.PosZ,
-                Moving     = f.Moving, Jump    = f.Jump,
-                SumForward = f.SumForward, SumLeft = f.SumLeft,
+                DeltaMs     = f.DeltaMs,    Facing      = f.Facing,
+                PosX        = f.PosX,       PosY        = f.PosY,       PosZ        = f.PosZ,
+                Moving      = f.Moving,     Jump        = f.Jump,
+                SumForward  = f.SumForward, SumLeft     = f.SumLeft,
+                CameraYaw   = f.CameraYaw,  CameraPitch = f.CameraPitch,
             });
         return copy;
     }
@@ -53,12 +57,15 @@ public sealed class PuzzleSegment
 // ─────────────────────────────────────────────────────────────────────────────
 public sealed class StartPoint
 {
-    public Vector3 Position   { get; set; }
-    public float   Facing     { get; set; }
-    public float   SnapRadius { get; set; } = 5f;
+    public Vector3 Position    { get; set; }
+    public float   Facing      { get; set; }
+    public float   SnapRadius  { get; set; } = 5f;
+    public float   CameraYaw   { get; set; }   // DirH — horizontal camera angle at record time
+    public float   CameraPitch { get; set; }   // DirV — vertical camera angle at record time
 
     public StartPoint Clone() => new()
-        { Position = Position, Facing = Facing, SnapRadius = SnapRadius };
+        { Position = Position, Facing = Facing, SnapRadius = SnapRadius,
+          CameraYaw = CameraYaw, CameraPitch = CameraPitch };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

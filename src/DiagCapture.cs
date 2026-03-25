@@ -8,20 +8,22 @@ using Dalamud.Plugin.Services;
 namespace JumpSolver;
 
 /// <summary>
-/// Diagnostic capture — records RMI input values and player position every framework tick.
-/// Two separate captures are intended: one during natural recording, one during playback.
+/// Diagnostic capture — records RMI input values, facing, and player position every framework tick.
+/// Two captures are intended: one during natural recording, one during playback.
 /// Writes a CSV to pluginConfigs so the two files can be compared side-by-side.
 ///
 /// Columns:
-///   ElapsedMs   — ms since capture started
-///   PosX/Y/Z    — player world position
-///   SpeedXZ     — XZ speed derived from position delta (yalms/s)
-///   NatFwd      — sumForward the game computed from real keyboard/gamepad input (pre-injection)
-///   NatLeft     — sumLeft the game computed from real keyboard/gamepad input (pre-injection)
-///   InjFwd      — sumForward that was actually sent to the physics engine
-///   InjLeft     — sumLeft that was actually sent to the physics engine
-///   Injecting   — 1 if the plugin was overriding input, 0 if natural
-///   JumpFired   — 1 on the frame a jump UseAction was accepted by the game
+///   ElapsedMs    — ms since capture started
+///   PosX/Y/Z     — player world position
+///   SpeedXZ      — XZ speed derived from position delta (yalms/s)
+///   Facing       — player facing in radians (obj->Rotation)
+///   NatFwd       — sumForward from real keyboard input (pre-injection)
+///   NatLeft      — sumLeft from real keyboard input (pre-injection)
+///   NatTurnLeft  — sumTurnLeft from real keyboard input (A/D in Standard mode)
+///   InjFwd       — sumForward sent to physics engine
+///   InjLeft      — sumLeft sent to physics engine
+///   Injecting    — 1 if plugin was overriding input, 0 if natural
+///   JumpFired    — 1 on the frame a jump UseAction was accepted by the game
 /// </summary>
 internal sealed class DiagCapture
 {
@@ -30,7 +32,8 @@ internal sealed class DiagCapture
         public float ElapsedMs;
         public float PosX, PosY, PosZ;
         public float SpeedXZ;
-        public float NatFwd, NatLeft;
+        public float Facing;
+        public float NatFwd, NatLeft, NatTurnLeft;
         public float InjFwd, InjLeft;
         public bool  Injecting;
         public bool  JumpFired;
@@ -63,8 +66,8 @@ internal sealed class DiagCapture
     /// <summary>
     /// Add one frame. Call from Plugin.OnUpdate after player.Tick.
     /// </summary>
-    public void AddFrame(float deltaMs, Vector3 pos,
-                         float natFwd, float natLeft,
+    public void AddFrame(float deltaMs, Vector3 pos, float facing,
+                         float natFwd, float natLeft, float natTurnLeft,
                          float injFwd, float injLeft,
                          bool  injecting, bool jumpFired)
     {
@@ -81,17 +84,19 @@ internal sealed class DiagCapture
 
         frames.Add(new Frame
         {
-            ElapsedMs = elapsed,
-            PosX      = pos.X,
-            PosY      = pos.Y,
-            PosZ      = pos.Z,
-            SpeedXZ   = speedXZ,
-            NatFwd    = natFwd,
-            NatLeft   = natLeft,
-            InjFwd    = injFwd,
-            InjLeft   = injLeft,
-            Injecting = injecting,
-            JumpFired = jumpFired,
+            ElapsedMs   = elapsed,
+            PosX        = pos.X,
+            PosY        = pos.Y,
+            PosZ        = pos.Z,
+            SpeedXZ     = speedXZ,
+            Facing      = facing,
+            NatFwd      = natFwd,
+            NatLeft     = natLeft,
+            NatTurnLeft = natTurnLeft,
+            InjFwd      = injFwd,
+            InjLeft     = injLeft,
+            Injecting   = injecting,
+            JumpFired   = jumpFired,
         });
 
         elapsed += deltaMs;
@@ -120,11 +125,12 @@ internal sealed class DiagCapture
                 $"JumpSolver_diag_{label}_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
 
             using var w = new StreamWriter(path);
-            w.WriteLine("ElapsedMs,PosX,PosY,PosZ,SpeedXZ,NatFwd,NatLeft,InjFwd,InjLeft,Injecting,JumpFired");
+            w.WriteLine("ElapsedMs,PosX,PosY,PosZ,SpeedXZ,Facing,NatFwd,NatLeft,NatTurnLeft,InjFwd,InjLeft,Injecting,JumpFired");
             foreach (var f in frames)
                 w.WriteLine(
                     $"{f.ElapsedMs:F1},{f.PosX:F4},{f.PosY:F4},{f.PosZ:F4}," +
-                    $"{f.SpeedXZ:F4},{f.NatFwd:F4},{f.NatLeft:F4}," +
+                    $"{f.SpeedXZ:F4},{f.Facing:F4}," +
+                    $"{f.NatFwd:F4},{f.NatLeft:F4},{f.NatTurnLeft:F4}," +
                     $"{f.InjFwd:F4},{f.InjLeft:F4}," +
                     $"{(f.Injecting ? 1 : 0)},{(f.JumpFired ? 1 : 0)}");
 

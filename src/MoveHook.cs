@@ -2,6 +2,7 @@ using System;
 
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 
 namespace JumpSolver;
@@ -18,16 +19,31 @@ namespace JumpSolver;
 /// </summary>
 internal sealed unsafe class MoveHook : IDisposable
 {
-    // ── Injected movement, written by JumpPlayer each frame ──────────────────
-    public float InjectedForward { get; set; }   //  1 = full forward,  -1 = backward
-    public float InjectedLeft    { get; set; }   //  1 = full left,     -1 = right
-    public bool  Injecting       => InjectedForward != 0f || InjectedLeft != 0f;
+    // ── Injected movement, written by JumpPlayer / control commands each frame ─
+    public float InjectedForward  { get; set; }   //  1 = full forward,  -1 = backward
+    public float InjectedLeft     { get; set; }   //  1 = full left,     -1 = right (strafe)
+    public float InjectedTurnLeft { get; set; }   //  1 = turn left,     -1 = turn right
+    public bool  Injecting        => InjectedForward != 0f || InjectedLeft != 0f || InjectedTurnLeft != 0f;
 
     // ── Natural (pre-injection) values from last RMI frame ───────────────────
-    // These are what the game computed from real keyboard/gamepad input BEFORE
-    // we overwrite them. Useful for comparing natural vs injected movement.
-    public float LastNaturalForward { get; private set; }
-    public float LastNaturalLeft    { get; private set; }
+    // HandleMoveInput is called multiple times per Framework.Update tick.
+    // LastNatural* = value from the most recent call (may be a spurious zero).
+    // PeakNatural* = highest-magnitude value seen since ResetNaturalPeaks() was last called.
+    // Use PeakNatural* for display/recording; call ResetNaturalPeaks() at the start of each tick.
+    public float LastNaturalForward  { get; private set; }
+    public float LastNaturalLeft     { get; private set; }
+    public float LastNaturalTurnLeft { get; private set; }
+
+    public float PeakNaturalForward  { get; private set; }
+    public float PeakNaturalLeft     { get; private set; }
+    public float PeakNaturalTurnLeft { get; private set; }
+
+    public void ResetNaturalPeaks()
+    {
+        PeakNaturalForward  = 0f;
+        PeakNaturalLeft     = 0f;
+        PeakNaturalTurnLeft = 0f;
+    }
 
     // ── Whether the hook was installed successfully ───────────────────────────
     public bool IsAvailable => rmiWalkHook != null;
@@ -94,15 +110,21 @@ internal sealed unsafe class MoveHook : IDisposable
                 self, sumLeft, sumForward, sumTurnLeft,
                 haveBackwardOrStrafe, a6, a7);
 
-            LastNaturalForward = *sumForward;
-            LastNaturalLeft    = *sumLeft;
+            LastNaturalForward  = *sumForward;
+            LastNaturalLeft     = *sumLeft;
+            LastNaturalTurnLeft = *sumTurnLeft;
+
+            // Track highest-magnitude values seen this tick for stable display/recording.
+            if (MathF.Abs(*sumForward)   > MathF.Abs(PeakNaturalForward))  PeakNaturalForward  = *sumForward;
+            if (MathF.Abs(*sumLeft)      > MathF.Abs(PeakNaturalLeft))     PeakNaturalLeft     = *sumLeft;
+            if (MathF.Abs(*sumTurnLeft)  > MathF.Abs(PeakNaturalTurnLeft)) PeakNaturalTurnLeft = *sumTurnLeft;
 
             if (Injecting)
             {
-                *sumForward             = InjectedForward;
-                *sumLeft                = InjectedLeft;
-                *sumTurnLeft            = 0f;
-                *haveBackwardOrStrafe   = (byte)(InjectedLeft != 0f ? 1 : 0);
+                *sumForward           = InjectedForward;
+                *sumLeft              = InjectedLeft;
+                *sumTurnLeft          = InjectedTurnLeft;
+                *haveBackwardOrStrafe = (byte)(InjectedLeft != 0f ? 1 : 0);
             }
 
             return result;
@@ -121,7 +143,7 @@ internal sealed unsafe class MoveHook : IDisposable
     public void MoveForward() { InjectedForward = 1f; InjectedLeft = 0f; }
 
     /// <summary>Stop all injected movement.</summary>
-    public void ClearInjection() { InjectedForward = 0f; InjectedLeft = 0f; }
+    public void ClearInjection() { InjectedForward = 0f; InjectedLeft = 0f; InjectedTurnLeft = 0f; }
 
     // ── Rotation / facing ─────────────────────────────────────────────────────
 
@@ -140,6 +162,78 @@ internal sealed unsafe class MoveHook : IDisposable
         catch (Exception ex)
         {
             log.Error(ex, "JumpSolver: failed to set player rotation.");
+        }
+    }
+
+    // ── Camera ────────────────────────────────────────────────────────────────
+
+    private bool _cameraLoggedOnce = false;
+
+    public (float yaw, float pitch) GetCameraAngles()
+    {
+        try
+        {
+            var mgr = CameraManager.Instance();
+            if (mgr == null)
+            {
+                if (!_cameraLoggedOnce) { log.Warning("JumpSolver: CameraManager.Instance() is null"); _cameraLoggedOnce = true; }
+                return (0f, 0f);
+            }
+            var cam = mgr->Cameras[0];
+            if (cam.Value == null)
+            {
+                if (!_cameraLoggedOnce) { log.Warning("JumpSolver: Cameras[0].Value is null"); _cameraLoggedOnce = true; }
+                return (0f, 0f);
+            }
+            _cameraLoggedOnce = false;
+            return (cam.Value->DirH, cam.Value->DirV);
+        }
+        catch (Exception ex)
+        {
+            if (!_cameraLoggedOnce) { log.Error(ex, "JumpSolver: GetCameraAngles failed"); _cameraLoggedOnce = true; }
+            return (0f, 0f);
+        }
+    }
+
+    public void SetCameraAngles(float yaw, float pitch)
+    {
+        try
+        {
+            var mgr = CameraManager.Instance();
+            if (mgr == null) return;
+            var cam = mgr->Cameras[0];
+            if (cam.Value == null) return;
+            cam.Value->DirH = yaw;
+            cam.Value->DirV = Math.Clamp(pitch, cam.Value->DirVMin, cam.Value->DirVMax);
+        }
+        catch (Exception ex) { log.Error(ex, "JumpSolver: SetCameraAngles failed"); }
+    }
+
+    // ── Position correction ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Nudges the player's XZ position toward (<paramref name="targetX"/>, <paramref name="targetZ"/>)
+    /// by at most <paramref name="maxDelta"/> yalms per call.
+    /// No-ops if the offset is negligible (&lt;0.001) or too large (&gt;0.5 — something went wrong).
+    /// Must be called on the framework thread.
+    /// </summary>
+    public void NudgeXZ(nint playerAddress, float targetX, float targetZ, float maxDelta = 0.05f)
+    {
+        if (playerAddress == nint.Zero) return;
+        try
+        {
+            var   obj  = (GameObject*)playerAddress;
+            float dx   = targetX - obj->Position.X;
+            float dz   = targetZ - obj->Position.Z;
+            float dist = MathF.Sqrt(dx * dx + dz * dz);
+            if (dist < 0.001f || dist > 0.5f) return;
+            float scale = MathF.Min(maxDelta, dist) / dist;
+            obj->Position.X += dx * scale;
+            obj->Position.Z += dz * scale;
+        }
+        catch (Exception ex)
+        {
+            log.Error(ex, "JumpSolver: failed to nudge player position.");
         }
     }
 }

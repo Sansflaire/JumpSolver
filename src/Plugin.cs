@@ -1,12 +1,15 @@
 using System;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using Dalamud.Plugin.Ipc;
 using Dalamud.Bindings.ImGui;
+
 
 namespace JumpSolver;
 
@@ -29,12 +32,23 @@ public sealed class Plugin : IDalamudPlugin
     private readonly DiagCapture   diag;
     private readonly Configuration config;
 
+    // ── Input monitoring ──────────────────────────────────────────────────────
+    internal static InputMonitor InputMonitor { get; } = new();
+    private ICallGateProvider<string>? ipcInputState;
+    // Pre-serialized on the framework thread every tick — safe to read from any thread via IPC.
+    private volatile string _lastInputJson = "{}";
+
+    // ── Control injection timer ───────────────────────────────────────────────
+    // Set by /js control — injection runs until this UTC-ms timestamp.
+    private long controlUntilMs = 0L;
+
     // ── Active puzzle ─────────────────────────────────────────────────────────
     private JumpPuzzle puzzle = new();
 
     // ── UI state ──────────────────────────────────────────────────────────────
     private bool   showWindow  = false;
     private bool   showDiag    = false;
+    private bool   showHud     = false;
     private int    loadIndex   = -1;
     private string saveName    = "";
 
@@ -61,14 +75,32 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage =
                 "JumpSolver — jump puzzle automation\n" +
                 "  /js             Toggle window\n" +
+                "  /js hud         Toggle input monitor overlay\n" +
                 "  /js setstart    Mark current position as start\n" +
                 "  /js gotostart   Walk character to start point\n" +
                 "  /js rec         Start new recording (clears existing)\n" +
                 "  /js seg         Append a new segment to the recording\n" +
                 "  /js stop        Stop recording or playback\n" +
-                "  /js play        Play back the recording from start",
+                "  /js play        Play back the recording from start\n" +
+                "  /js control <fwd> <left> <turn> <ms>   Inject movement for N ms\n" +
+                "  /js control stop   Stop injected movement immediately\n" +
+                "  /js jump        Fire a single jump\n" +
+                "  /js diag natural   Start diagnostic capture (natural input)\n" +
+                "  /js diag play      Start diagnostic capture (playback input)\n" +
+                "  /js diag stop      Stop diagnostic capture and write CSV",
         });
         CommandManager.AddHandler(CmdJs, new CommandInfo(OnCommand) { ShowInHelp = false });
+
+        // Publish input state via IPC so ClaudeAccessXIV can read it.
+        try
+        {
+            ipcInputState = PluginInterface.GetIpcProvider<string>("JumpSolver.GetInputState");
+            ipcInputState.RegisterFunc(() => _lastInputJson);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "JumpSolver: IPC provider registration failed.");
+        }
 
         Framework.Update                     += OnUpdate;
         PluginInterface.UiBuilder.Draw       += DrawUI;
@@ -88,6 +120,9 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.RemoveHandler(CmdMain);
         CommandManager.RemoveHandler(CmdJs);
+
+        try { ipcInputState?.UnregisterFunc(); } catch { }
+
         mover.Dispose();
     }
 
@@ -102,22 +137,42 @@ public sealed class Plugin : IDalamudPlugin
 
             float dt = (float)fw.UpdateDelta.TotalMilliseconds;
 
-            if (recorder.State == RecordState.Recording)
-                recorder.Tick(dt, lp.Position, lp.Rotation,
-                              mover.LastNaturalForward, mover.LastNaturalLeft);
+            // Control timer — clear injection when /js control duration expires
+            if (controlUntilMs > 0L && player.State == PlayState.Idle
+                && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() >= controlUntilMs)
+            {
+                mover.ClearInjection();
+                controlUntilMs = 0L;
+            }
 
             if (player.State != PlayState.Idle)
                 player.Tick(dt, lp.Address, lp.Position);
+
+            // Input monitor runs before the recorder so KeySpace is fresh for jump detection.
+            // Framework.Update fires BEFORE the RMI hook, so peaks here are from the previous
+            // frame's RMI calls — accurate and one frame stale at most.
+            InputMonitor.Update(dt, lp.Position, lp.Rotation, mover, player.LastJumpFired);
+            _lastInputJson = JsonSerializer.Serialize(InputMonitor.Snapshot);
+
+            if (recorder.State == RecordState.Recording)
+            {
+                var (camYaw, camPitch) = mover.GetCameraAngles();
+                recorder.Tick(dt, lp.Position, lp.Rotation,
+                              mover.PeakNaturalForward, mover.PeakNaturalLeft,
+                              InputMonitor.KeySpace, camYaw, camPitch);
+            }
 
             if (diag.IsActive)
             {
                 float injFwd  = mover.Injecting ? mover.InjectedForward : mover.LastNaturalForward;
                 float injLeft = mover.Injecting ? mover.InjectedLeft    : mover.LastNaturalLeft;
-                diag.AddFrame(dt, lp.Position,
-                    mover.LastNaturalForward, mover.LastNaturalLeft,
+                diag.AddFrame(dt, lp.Position, lp.Rotation,
+                    mover.PeakNaturalForward, mover.PeakNaturalLeft, mover.PeakNaturalTurnLeft,
                     injFwd, injLeft,
                     mover.Injecting, player.LastJumpFired);
             }
+
+            mover.ResetNaturalPeaks();
         }
         catch (Exception ex)
         {
@@ -129,16 +184,27 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnCommand(string cmd, string args)
     {
-        switch (args.Trim().ToLowerInvariant())
+        var arg = args.Trim().ToLowerInvariant();
+        switch (arg)
         {
-            case "":          showWindow = !showWindow; break;
-            case "setstart":  CmdSetStart();            break;
-            case "gotostart": CmdGotoStart();           break;
-            case "rec":       CmdRec();                 break;
-            case "seg":       CmdAddSegment();          break;
-            case "stop":      CmdStop();                break;
-            case "play":      CmdPlay();                break;
-            default: ChatGui.Print($"[JumpSolver] Unknown: {args}"); break;
+            case "":               showWindow = !showWindow;         break;
+            case "hud":            showHud    = !showHud;            break;
+            case "setstart":       CmdSetStart();                    break;
+            case "gotostart":      CmdGotoStart();                   break;
+            case "rec":            CmdRec();                         break;
+            case "seg":            CmdAddSegment();                  break;
+            case "stop":           CmdStop();                        break;
+            case "play":           CmdPlay();                        break;
+            case "jump":           CmdJump();                        break;
+            case "control stop":   mover.ClearInjection();
+                                   controlUntilMs = 0L;              break;
+            case "diag natural":   CmdDiag("natural");               break;
+            case "diag play":      CmdDiag("play");                  break;
+            case "diag stop":      CmdDiagStop();                    break;
+            default:
+                if (arg.StartsWith("control ")) CmdControl(args.Trim()[8..]);
+                else ChatGui.Print($"[JumpSolver] Unknown: {args}");
+                break;
         }
     }
 
@@ -146,9 +212,17 @@ public sealed class Plugin : IDalamudPlugin
     {
         var lp = ObjectTable.LocalPlayer;
         if (lp == null) { ChatGui.Print("[JumpSolver] Not logged in."); return; }
-        puzzle.Start = new StartPoint { Position = lp.Position, Facing = lp.Rotation };
-        ChatGui.Print($"[JumpSolver] Start set at ({lp.Position.X:F1}, {lp.Position.Y:F1}, {lp.Position.Z:F1}).");
+        var (yaw, pitch) = mover.GetCameraAngles();
+        puzzle.Start = new StartPoint
+        {
+            Position    = lp.Position,
+            Facing      = lp.Rotation,
+            CameraYaw   = yaw,
+            CameraPitch = pitch,
+        };
+        ChatGui.Print($"[JumpSolver] Start set at ({lp.Position.X:F1}, {lp.Position.Y:F1}, {lp.Position.Z:F1}), cam yaw={yaw:F2}.");
     }
+
 
     private void CmdGotoStart()
     {
@@ -218,7 +292,72 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (recorder.State != RecordState.Idle) { ChatGui.Print("[JumpSolver] Stop recording first."); return; }
         if (!player.TryStart(puzzle, out var err))
+        {
             ChatGui.Print($"[JumpSolver] {err}");
+            return;
+        }
+        // Snap camera to the angle it was at when the start point was recorded.
+        if (puzzle.Start != null)
+            mover.SetCameraAngles(puzzle.Start.CameraYaw, puzzle.Start.CameraPitch);
+    }
+
+    private void CmdDiag(string label)
+    {
+        if (diag.IsActive) diag.Stop();
+        diag.Start(label);
+        ChatGui.Print($"[JumpSolver] Diag capture started ({label}). Do your run, then /js diag stop.");
+    }
+
+    private void CmdDiagStop()
+    {
+        if (!diag.IsActive) { ChatGui.Print("[JumpSolver] Diag not running."); return; }
+        string path = diag.Stop();
+        ChatGui.Print(string.IsNullOrEmpty(path)
+            ? "[JumpSolver] Diag: no frames captured."
+            : $"[JumpSolver] Diag saved: {path}");
+    }
+
+    private void CmdControl(string args)
+    {
+        var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 4)
+        {
+            ChatGui.Print("[JumpSolver] Usage: /js control <fwd> <left> <turn> <ms>  (all floats)");
+            return;
+        }
+        if (!float.TryParse(parts[0], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float fwd)  ||
+            !float.TryParse(parts[1], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float left) ||
+            !float.TryParse(parts[2], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float turn) ||
+            !float.TryParse(parts[3], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float ms))
+        {
+            ChatGui.Print("[JumpSolver] /js control: all arguments must be numbers.");
+            return;
+        }
+
+        mover.InjectedForward  = Math.Clamp(fwd,  -1f, 1f);
+        mover.InjectedLeft     = Math.Clamp(left, -1f, 1f);
+        mover.InjectedTurnLeft = Math.Clamp(turn, -1f, 1f);
+        controlUntilMs         = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + (long)ms;
+        Log.Info($"JumpSolver: control injected — fwd={fwd:F2} left={left:F2} turn={turn:F2} for {ms:F0}ms.");
+    }
+
+    private static unsafe void CmdJump()
+    {
+        try
+        {
+            var am = FFXIVClientStructs.FFXIV.Client.Game.ActionManager.Instance();
+            if (am == null) return;
+            am->UseAction((FFXIVClientStructs.FFXIV.Client.Game.ActionType)5,
+                          Signatures.JumpActionId, 0xE0000000);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "JumpSolver: /js jump exception.");
+        }
     }
 
     // ── UI ────────────────────────────────────────────────────────────────────
@@ -226,6 +365,7 @@ public sealed class Plugin : IDalamudPlugin
     private void DrawUI()
     {
         DrawWorldMarker();
+        if (showHud) DrawInputHud();
 
         if (!showWindow) return;
 
@@ -276,6 +416,10 @@ public sealed class Plugin : IDalamudPlugin
         if (player.State == PlayState.Playing)
             return ($"PLAYING {player.FrameIndex}/{player.PlaybackFrameCount}",
                     new Vector4(0.3f, 0.8f, 1f, 1f));
+        if (player.State == PlayState.WpWaitLand)
+            return ("IN AIR", new Vector4(0.6f, 0.9f, 1f, 1f));
+        if (player.State == PlayState.WpNav)
+            return ("MOVING TO NEXT", new Vector4(0.3f, 0.8f, 1f, 1f));
         if (player.State == PlayState.WalkingToStart)
             return ("WALKING", new Vector4(1f, 0.85f, 0.2f, 1f));
         if (recorder.State == RecordState.Recording)
@@ -336,7 +480,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         ImGui.Spacing();
         bool isRec     = recorder.State == RecordState.Recording;
-        bool isPlaying = player.State   == PlayState.Playing;
+        bool isPlaying = player.State   == PlayState.Playing
+                      || player.State   == PlayState.WpWaitLand
+                      || player.State   == PlayState.WpNav;
         bool isWalking = player.State   == PlayState.WalkingToStart;
 
         if (isRec)
@@ -544,6 +690,138 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.SavePluginConfig(config);
         if (loadIndex >= config.SavedPuzzles.Count) loadIndex = config.SavedPuzzles.Count - 1;
         ChatGui.Print($"[JumpSolver] Deleted '{name}'.");
+    }
+
+    // ── Input HUD overlay ─────────────────────────────────────────────────────
+
+    private void DrawInputHud()
+    {
+        var m = InputMonitor;
+
+        ImGui.SetNextWindowSize(new Vector2(270, 0), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowPos(new Vector2(10, 200), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowBgAlpha(0.82f);
+
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.05f, 0.05f, 0.10f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(8f, 6f));
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing,   new Vector2(4f, 3f));
+
+        bool open = showHud;
+        if (!ImGui.Begin("Input Monitor##jshud", ref open,
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse |
+                ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            ImGui.PopStyleVar(2);
+            ImGui.PopStyleColor();
+            ImGui.End();
+            showHud = open;
+            return;
+        }
+        showHud = open;
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor();
+
+        // ── Header ────────────────────────────────────────────────────────────
+        ImGui.TextColored(new Vector4(0.4f, 0.85f, 1f, 1f), "INPUT MONITOR");
+        if (m.Injecting)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, 0.55f, 0.1f, 1f), "[INJECTING]");
+        }
+
+        ImGui.Separator();
+
+        // ── RMI float bars ────────────────────────────────────────────────────
+        float activeForward  = m.Injecting ? m.InjForward  : m.NatForward;
+        float activeLeft     = m.Injecting ? m.InjLeft     : m.NatLeft;
+        float activeTurnLeft = m.Injecting ? m.InjTurnLeft : m.NatTurnLeft;
+
+        DrawInputBar("Fwd  ", activeForward,  new Vector4(0.2f, 0.9f, 0.4f, 1f));
+        DrawInputBar("Left ", activeLeft,     new Vector4(0.9f, 0.75f, 0.2f, 1f));
+        DrawInputBar("Turn ", activeTurnLeft, new Vector4(0.7f, 0.4f, 0.95f, 1f));
+
+        // Show both nat and inj if injecting
+        if (m.Injecting)
+        {
+            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f),
+                $"  nat: fwd={m.NatForward:F2} left={m.NatLeft:F2} turn={m.NatTurnLeft:F2}");
+        }
+
+        ImGui.Separator();
+
+        // ── Raw key state ─────────────────────────────────────────────────────
+        ImGui.Text("Keys ");
+        ImGui.SameLine();
+        DrawKeyDot("W", m.KeyW);  ImGui.SameLine();
+        DrawKeyDot("A", m.KeyA);  ImGui.SameLine();
+        DrawKeyDot("S", m.KeyS);  ImGui.SameLine();
+        DrawKeyDot("D", m.KeyD);  ImGui.SameLine();
+        DrawKeyDot("Q", m.KeyQ);  ImGui.SameLine();
+        DrawKeyDot("E", m.KeyE);  ImGui.SameLine();
+        DrawKeyDot("SPC", m.KeySpace);
+
+        ImGui.Text("Mouse");
+        ImGui.SameLine();
+        DrawKeyDot("LMB", m.LMB); ImGui.SameLine();
+        DrawKeyDot("RMB", m.RMB); ImGui.SameLine();
+        ImGui.TextColored(new Vector4(0.65f, 0.65f, 0.65f, 1f),
+            $"  dX:{m.MouseDeltaX:+0;-0;+0}  dY:{m.MouseDeltaY:+0;-0;+0}");
+
+        ImGui.Separator();
+
+        // ── Character state ───────────────────────────────────────────────────
+        float deg = m.CharFacing * (180f / MathF.PI);
+        ImGui.Text($"Facing  {deg:F1}°");
+        ImGui.SameLine(130);
+        ImGui.Text($"Speed  {m.SpeedXZ:F2} y/s");
+
+        ImGui.Text($"Pos  ({m.Position.X:F2}, {m.Position.Y:F2}, {m.Position.Z:F2})");
+
+        if (m.JumpFired)
+            ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f), "● JUMP FIRED");
+
+        ImGui.End();
+    }
+
+    private static void DrawInputBar(string label, float value, Vector4 color)
+    {
+        const float BarW = 140f;
+
+        ImGui.Text(label);
+        ImGui.SameLine();
+
+        var  dl  = ImGui.GetWindowDrawList();
+        var  pos = ImGui.GetCursorScreenPos();
+        float h  = ImGui.GetTextLineHeight();
+
+        // Background track
+        dl.AddRectFilled(pos, pos + new Vector2(BarW, h),
+            ImGui.GetColorU32(new Vector4(0.12f, 0.12f, 0.18f, 1f)));
+
+        // Center line
+        float cx = BarW * 0.5f;
+        dl.AddLine(pos + new Vector2(cx, 0), pos + new Vector2(cx, h),
+            ImGui.GetColorU32(new Vector4(0.45f, 0.45f, 0.45f, 0.9f)), 1.5f);
+
+        // Filled portion (center to value)
+        float norm    = (value + 1f) * 0.5f;   // map -1..1 → 0..1
+        float barFrom = MathF.Min(cx, norm * BarW);
+        float barTo   = MathF.Max(cx, norm * BarW);
+        if (barTo > barFrom + 0.5f)
+            dl.AddRectFilled(pos + new Vector2(barFrom, 1f), pos + new Vector2(barTo, h - 1f),
+                ImGui.GetColorU32(color));
+
+        ImGui.Dummy(new Vector2(BarW, h));
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(0.85f, 0.85f, 0.85f, 1f), $"{value:F2}");
+    }
+
+    private static void DrawKeyDot(string label, bool down)
+    {
+        var col = down
+            ? new Vector4(0.25f, 1f, 0.25f, 1f)
+            : new Vector4(0.28f, 0.28f, 0.30f, 1f);
+        ImGui.TextColored(col, label);
     }
 
     // ── World-space markers ───────────────────────────────────────────────────

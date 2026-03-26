@@ -31,11 +31,25 @@
     <Reference Include="Newtonsoft.Json"      HintPath="$(DalamudLibPath)Newtonsoft.Json.dll"      Private="false" />
     <Reference Include="Serilog"              HintPath="$(DalamudLibPath)Serilog.dll"              Private="false" />
     <Reference Include="PanacheUI"            HintPath="$(APPDATA)\XIVLauncher\devPlugins\PanacheUI\PanacheUI.dll" Private="false" />
+    <Reference Include="SkiaSharp"            HintPath="$(APPDATA)\XIVLauncher\devPlugins\PanacheUI\SkiaSharp.dll"   Private="false" />
   </ItemGroup>
 
   <Target Name="CopyToDevPlugins" AfterTargets="Build" Condition="'$(Configuration)' == 'Debug'">
     <Copy
       SourceFiles="$(TargetPath)"
+      DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\JumpSolver\"
+      OverwriteReadOnlyFiles="true"
+    />
+    <!-- PanacheUI and SkiaSharp must sit alongside JumpSolver.dll so Dalamud's
+         per-plugin ALC can resolve them.  Private="false" keeps them out of bin/
+         but we need them in the devPlugins output folder. -->
+    <Copy
+      SourceFiles="$(APPDATA)\XIVLauncher\devPlugins\PanacheUI\PanacheUI.dll"
+      DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\JumpSolver\"
+      OverwriteReadOnlyFiles="true"
+    />
+    <Copy
+      SourceFiles="$(APPDATA)\XIVLauncher\devPlugins\PanacheUI\SkiaSharp.dll"
       DestinationFolder="$(APPDATA)\XIVLauncher\devPlugins\JumpSolver\"
       OverwriteReadOnlyFiles="true"
     />

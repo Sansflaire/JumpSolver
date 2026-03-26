@@ -279,16 +279,18 @@ internal sealed unsafe class JumpPlayer
 
         mover.SetPlayerFacing(playerAddress, frame.Facing);
 
-        // Camera yaw = character facing + π puts the camera BEHIND the character.
-        // Rate-limited via ApplyCamAngle so transitions after WpNav arrival are smooth.
+        // Camera yaw: snap directly to the exact recorded angle every frame.
+        // ApplyCamAngle rate-limiting is intentionally NOT used here — during Playing we
+        // want the camera at the recorded angle immediately, not tracking toward it slowly.
+        // Fall back to Facing+π for old recordings that don't have CameraYaw.
         {
-            var (curYaw, curPitch) = mover.GetCameraAngles();
-            float targetPitch = (frame.CameraPitch != 0f)
-                ? ApplyCamAngle(curPitch, frame.CameraPitch)
-                : curPitch;
-            float behindYaw = frame.Facing + MathF.PI;
-            if (behindYaw > MathF.PI) behindYaw -= 2f * MathF.PI;
-            mover.SetCameraAngles(ApplyCamAngle(curYaw, behindYaw), targetPitch);
+            var (_, curPitch) = mover.GetCameraAngles();
+            float targetPitch = (frame.CameraPitch != 0f) ? frame.CameraPitch : curPitch;
+            float targetYaw   = (frame.CameraYaw != 0f)
+                ? frame.CameraYaw
+                : frame.Facing + MathF.PI;
+            if (targetYaw > MathF.PI) targetYaw -= 2f * MathF.PI;
+            mover.SetCameraAngles(targetYaw, targetPitch);
         }
 
         // Prefer exact recorded RMI floats; fall back to binary Moving for old saves.

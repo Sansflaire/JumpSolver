@@ -9,6 +9,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Textures;
 
 
 namespace JumpSolver;
@@ -24,13 +25,16 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IFramework             Framework       { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider   GameInterop     { get; private set; } = null!;
     [PluginService] internal static IGameGui               GameGui         { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider       TextureProvider { get; private set; } = null!;
 
     // ── Systems ───────────────────────────────────────────────────────────────
-    private readonly MoveHook      mover;
-    private readonly JumpRecorder  recorder;
-    private readonly JumpPlayer    player;
-    private readonly DiagCapture   diag;
-    private readonly Configuration config;
+    private readonly MoveHook           mover;
+    private readonly JumpRecorder       recorder;
+    private readonly JumpPlayer         player;
+    private readonly DiagCapture        diag;
+    private readonly Configuration      config;
+    private readonly JumpSolverWindow   mainWindow;
+    private readonly FrameEditorWindow  editorWindow;
 
     // ── Input monitoring ──────────────────────────────────────────────────────
     internal static InputMonitor InputMonitor { get; } = new();
@@ -45,12 +49,8 @@ public sealed class Plugin : IDalamudPlugin
     // ── Active puzzle ─────────────────────────────────────────────────────────
     private JumpPuzzle puzzle = new();
 
-    // ── UI state ──────────────────────────────────────────────────────────────
-    private bool   showWindow  = false;
-    private bool   showDiag    = false;
-    private bool   showHud     = false;
-    private int    loadIndex   = -1;
-    private string saveName    = "";
+    // ── UI state (legacy — kept for /js hud command) ──────────────────────────
+    private bool showHud = false;
 
     // Pending new segment — set when Stop is clicked during a recording that
     // should be appended as a new segment rather than replacing everything.
@@ -64,11 +64,40 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
-        config   = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        mover    = new MoveHook(GameInterop, Log);
-        recorder = new JumpRecorder(Log);
-        player   = new JumpPlayer(mover, ObjectTable, ChatGui, Log);
-        diag     = new DiagCapture(Log);
+        config       = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        mover        = new MoveHook(GameInterop, Log);
+        recorder     = new JumpRecorder(Log);
+        player       = new JumpPlayer(mover, ObjectTable, ChatGui, Log);
+        diag         = new DiagCapture(Log);
+        editorWindow = new FrameEditorWindow(TextureProvider)
+        {
+            OnSave = SavePuzzle,
+        };
+        mainWindow = new JumpSolverWindow(TextureProvider, player, recorder, mover, diag, ObjectTable)
+        {
+            OnSetStart  = CmdSetStart,
+            OnGoToStart = CmdGotoStart,
+            OnRec       = CmdRec,
+            OnAddSeg    = CmdAddSegment,
+            OnPlay      = CmdPlay,
+            OnStop      = CmdStop,
+            OnTrim      = frameIdx =>
+            {
+                int trimAt = Math.Max(1, frameIdx);
+                player.Stop("trimmed");
+                var trimmed = puzzle.Segments.SelectMany(s => s.Frames).Take(trimAt).ToList();
+                puzzle.Segments.Clear();
+                puzzle.Segments.Add(new PuzzleSegment { Name = "Segment 1", Frames = trimmed });
+                ChatGui.Print($"[JumpSolver] Trimmed to {trimmed.Count} frames.");
+            },
+            OnSave   = name =>
+            {
+                if (!string.IsNullOrWhiteSpace(name)) puzzle.Name = name;
+                SavePuzzle();
+            },
+            OnLoad   = LoadPuzzle,
+            OnDelete = DeleteSavedPuzzle,
+        };
 
         CommandManager.AddHandler(CmdMain, new CommandInfo(OnCommand)
         {
@@ -104,7 +133,7 @@ public sealed class Plugin : IDalamudPlugin
 
         Framework.Update                     += OnUpdate;
         PluginInterface.UiBuilder.Draw       += DrawUI;
-        PluginInterface.UiBuilder.OpenMainUi += () => showWindow = true;
+        PluginInterface.UiBuilder.OpenMainUi += () => mainWindow.IsVisible = true;
 
         Log.Info("JumpSolver loaded.");
     }
@@ -116,13 +145,15 @@ public sealed class Plugin : IDalamudPlugin
 
         Framework.Update                     -= OnUpdate;
         PluginInterface.UiBuilder.Draw       -= DrawUI;
-        PluginInterface.UiBuilder.OpenMainUi -= () => showWindow = true;
+        PluginInterface.UiBuilder.OpenMainUi -= () => mainWindow.IsVisible = true;
 
         CommandManager.RemoveHandler(CmdMain);
         CommandManager.RemoveHandler(CmdJs);
 
         try { ipcInputState?.UnregisterFunc(); } catch { }
 
+        mainWindow.Dispose();
+        editorWindow.Dispose();
         mover.Dispose();
     }
 
@@ -187,8 +218,8 @@ public sealed class Plugin : IDalamudPlugin
         var arg = args.Trim().ToLowerInvariant();
         switch (arg)
         {
-            case "":               showWindow = !showWindow;         break;
-            case "hud":            showHud    = !showHud;            break;
+            case "":               mainWindow.IsVisible = !mainWindow.IsVisible; break;
+            case "hud":            showHud = !showHud;               break;
             case "setstart":       CmdSetStart();                    break;
             case "gotostart":      CmdGotoStart();                   break;
             case "rec":            CmdRec();                         break;
@@ -366,308 +397,15 @@ public sealed class Plugin : IDalamudPlugin
     {
         DrawWorldMarker();
         if (showHud) DrawInputHud();
-
-        if (!showWindow) return;
-
-        ImGui.SetNextWindowSize(new Vector2(480, 500), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("JumpSolver", ref showWindow)) { ImGui.End(); return; }
-
-        DrawHeader();
-        ImGui.Separator();
-        DrawStartSection();
-        ImGui.Separator();
-        DrawControls();
-        ImGui.Separator();
-        DrawSegmentList();
-        ImGui.Separator();
-        if (showDiag) DrawDiagSection();
-        DrawSaveLoadSection();
-
-        ImGui.End();
-    }
-
-    // ── Header ────────────────────────────────────────────────────────────────
-
-    private void DrawHeader()
-    {
-        ImGui.TextColored(new Vector4(0.18f, 0.80f, 0.44f, 1f), "JumpSolver");
-        ImGui.SameLine();
-        var (txt, col) = GetStateLabel();
-        ImGui.TextColored(col, $"[{txt}]");
-
-        if (!mover.IsAvailable)
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1f, 0.4f, 0.2f, 1f), "hook unavailable");
-        }
-
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 35f);
-        bool d = showDiag;
-        if (ImGui.Checkbox("diag", ref d)) showDiag = d;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Show diagnostic capture panel");
-
-        var name = puzzle.Name;
-        ImGui.SetNextItemWidth(260);
-        if (ImGui.InputText("##pname", ref name, 80)) puzzle.Name = name;
-    }
-
-    private (string, Vector4) GetStateLabel()
-    {
-        if (player.State == PlayState.Playing)
-            return ($"PLAYING {player.FrameIndex}/{player.PlaybackFrameCount}",
-                    new Vector4(0.3f, 0.8f, 1f, 1f));
-        if (player.State == PlayState.WpWaitLand)
-            return ("IN AIR", new Vector4(0.6f, 0.9f, 1f, 1f));
-        if (player.State == PlayState.WpNav)
-            return ("MOVING TO NEXT", new Vector4(0.3f, 0.8f, 1f, 1f));
-        if (player.State == PlayState.WalkingToStart)
-            return ("WALKING", new Vector4(1f, 0.85f, 0.2f, 1f));
-        if (recorder.State == RecordState.Recording)
-            return ($"REC  {recorder.CapturedFrames.Count} frames", new Vector4(1f, 0.3f, 0.3f, 1f));
-        return ("idle", new Vector4(0.5f, 0.5f, 0.5f, 1f));
-    }
-
-    // ── Start section ─────────────────────────────────────────────────────────
-
-    private void DrawStartSection()
-    {
-        ImGui.Text("Start Point");
-        ImGui.SameLine();
-
-        bool idle = player.State == PlayState.Idle && recorder.State == RecordState.Idle;
-        if (!idle) ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Set Here")) CmdSetStart();
-        ImGui.SameLine();
-        bool canGo = puzzle.Start != null && idle && mover.IsAvailable;
-        if (!canGo) ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Go To Start")) CmdGotoStart();
-        if (!canGo) ImGui.EndDisabled();
-        if (!idle) ImGui.EndDisabled();
-
-        if (puzzle.Start != null)
-        {
-            var  s    = puzzle.Start;
-            var  lp   = ObjectTable.LocalPlayer;
-            float dist = lp != null ? Vector3.Distance(lp.Position, s.Position) : float.MaxValue;
-
-            var col = dist < 0.5f        ? new Vector4(0.3f, 1f, 0.3f, 1f)
-                    : dist < s.SnapRadius ? new Vector4(1f, 1f, 0.3f, 1f)
-                    :                       new Vector4(0.65f, 0.65f, 0.65f, 1f);
-
-            ImGui.TextColored(col,
-                $"  ({s.Position.X:F1}, {s.Position.Y:F1}, {s.Position.Z:F1})  " +
-                $"facing {s.Facing:F2}  dist {dist:F1}y");
-
-            float snap = s.SnapRadius;
-            ImGui.SetNextItemWidth(160);
-            if (ImGui.SliderFloat("snap##snap", ref snap, 1f, 30f)) s.SnapRadius = snap;
-
-            if (player.State == PlayState.WalkingToStart)
-            {
-                ImGui.SameLine();
-                if (ImGui.SmallButton("Stop Walking")) player.Stop("user cancelled walk");
-            }
-        }
-        else
-        {
-            ImGui.TextColored(new Vector4(1f, 0.65f, 0.2f, 1f), "  Not set.");
-        }
-    }
-
-    // ── Controls ──────────────────────────────────────────────────────────────
-
-    private void DrawControls()
-    {
-        ImGui.Spacing();
-        bool isRec     = recorder.State == RecordState.Recording;
-        bool isPlaying = player.State   == PlayState.Playing
-                      || player.State   == PlayState.WpWaitLand
-                      || player.State   == PlayState.WpNav;
-        bool isWalking = player.State   == PlayState.WalkingToStart;
-
-        if (isRec)
-        {
-            ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f),
-                $"● REC  {recorder.CapturedFrames.Count} frames");
-            ImGui.SameLine();
-            if (ImGui.Button("Stop##stoprec")) CmdStop();
-        }
-        else if (isPlaying)
-        {
-            ImGui.TextColored(new Vector4(0.3f, 0.8f, 1f, 1f),
-                $"PLAYING  {player.FrameIndex} / {player.PlaybackFrameCount}");
-            ImGui.SameLine();
-            if (ImGui.Button("Stop##stopplay")) CmdStop();
-            ImGui.SameLine();
-
-            // Trim at current frame
-            ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.6f, 0.2f, 0.2f, 1f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.85f, 0.3f, 0.3f, 1f));
-            if (ImGui.Button("Trim here"))
-            {
-                int trimAt = Math.Max(1, player.FrameIndex);
-                player.Stop("trimmed");
-                var trimmed = puzzle.Segments.SelectMany(s => s.Frames).Take(trimAt).ToList();
-                puzzle.Segments.Clear();
-                puzzle.Segments.Add(new PuzzleSegment { Name = "Segment 1", Frames = trimmed });
-                ChatGui.Print($"[JumpSolver] Trimmed to {trimmed.Count} frames.");
-            }
-            ImGui.PopStyleColor(2);
-        }
-        else if (!isWalking)
-        {
-            bool hookOk = mover.IsAvailable;
-            if (!hookOk) ImGui.BeginDisabled();
-
-            if (ImGui.Button("Rec")) CmdRec();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Start a fresh recording (clears existing). Stand at start, then run and jump.");
-
-            ImGui.SameLine();
-            bool canSeg = puzzle.HasRecording;
-            if (!canSeg) ImGui.BeginDisabled();
-            if (ImGui.Button("+ Seg")) CmdAddSegment();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Record an additional segment appended to the end");
-            if (!canSeg) ImGui.EndDisabled();
-
-            ImGui.SameLine();
-            bool canPlay = puzzle.Start != null && puzzle.HasRecording;
-            if (!canPlay) ImGui.BeginDisabled();
-            if (ImGui.Button("Play")) CmdPlay();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Play back from start point (must be standing there first)");
-            if (!canPlay) ImGui.EndDisabled();
-
-            if (!hookOk) ImGui.EndDisabled();
-        }
-        ImGui.Spacing();
-    }
-
-    // ── Segment list ──────────────────────────────────────────────────────────
-
-    private void DrawSegmentList()
-    {
-        if (puzzle.Segments.Count == 0)
-        {
-            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f),
-                "No recording yet. Press Rec and do your puzzle run.");
-            return;
-        }
-
-        ImGui.Text($"Recording  ({puzzle.TotalFrameCount} frames total, {puzzle.TotalJumpCount} jump(s))");
-
-        ImGui.BeginChild("##segs", new Vector2(0, 90), true);
-        for (int i = 0; i < puzzle.Segments.Count; i++)
-        {
-            var seg = puzzle.Segments[i];
-            ImGui.PushID(i);
-
-            bool playing = player.State == PlayState.Playing;
-            int  offset  = puzzle.Segments.Take(i).Sum(s => s.Frames.Count);
-            bool active  = playing && player.FrameIndex >= offset
-                                   && player.FrameIndex < offset + seg.Frames.Count;
-
-            var col = active ? new Vector4(0.3f, 1f, 0.3f, 1f)
-                             : new Vector4(0.75f, 0.75f, 0.75f, 1f);
-            ImGui.TextColored(col,
-                $"{i + 1}. {seg.Name}   {seg.Frames.Count} frames   {seg.JumpCount} jump(s)");
-
-            ImGui.SameLine();
-            if (recorder.State == RecordState.Idle && player.State == PlayState.Idle)
-            {
-                if (ImGui.SmallButton("Del##d"))
-                {
-                    puzzle.Segments.RemoveAt(i);
-                    ImGui.PopID();
-                    break;
-                }
-            }
-            ImGui.PopID();
-        }
-        ImGui.EndChild();
-    }
-
-    // ── Diag section ──────────────────────────────────────────────────────────
-
-    private void DrawDiagSection()
-    {
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Diagnostic Capture");
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(
-                "Captures raw RMI input + position every frame → writes CSV.\n" +
-                "Natural: capture your own keyboard input.\n" +
-                "Playback: capture what the plugin injects.\n" +
-                "Files go to: XIVLauncher\\pluginConfigs\\");
-
-        if (!diag.IsActive)
-        {
-            if (ImGui.SmallButton("Natural")) diag.Start("natural");
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Playback")) diag.Start("playback");
-        }
-        else
-        {
-            ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f), "● CAPTURING");
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Stop##diagstop"))
-            {
-                string path = diag.Stop();
-                ChatGui.Print(string.IsNullOrEmpty(path)
-                    ? "[JumpSolver] Diag: no frames captured."
-                    : $"[JumpSolver] Diag saved: {path}");
-            }
-        }
-        ImGui.Spacing();
-    }
-
-    // ── Save / Load ───────────────────────────────────────────────────────────
-
-    private void DrawSaveLoadSection()
-    {
-        ImGui.Text("Puzzles");
-        ImGui.Spacing();
-
-        ImGui.SetNextItemWidth(200);
-        ImGui.InputText("##savename", ref saveName, 80);
-        ImGui.SameLine();
-        if (ImGui.Button("Save"))
-        {
-            if (string.IsNullOrWhiteSpace(saveName)) saveName = puzzle.Name;
-            SavePuzzle();
-        }
-
-        ImGui.Spacing();
-
-        if (config.SavedPuzzles.Count == 0)
-        {
-            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f), "No saved puzzles.");
-            return;
-        }
-
-        ImGui.BeginChild("##savedlist", new Vector2(0, 100), true);
-        for (int i = 0; i < config.SavedPuzzles.Count; i++)
-        {
-            var  p   = config.SavedPuzzles[i];
-            bool sel = i == loadIndex;
-
-            ImGui.PushID(10000 + i);
-            if (ImGui.SmallButton("Load")) { LoadPuzzle(i); loadIndex = i; }
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Del")) { DeleteSavedPuzzle(i); ImGui.PopID(); break; }
-            ImGui.PopID();
-
-            ImGui.SameLine();
-            if (ImGui.Selectable(
-                $"{p.Name}  ({p.TotalFrameCount} frames, {p.Segments.Count} seg(s))##sl{i}",
-                sel, ImGuiSelectableFlags.None, new Vector2(0, 0)))
-                loadIndex = i;
-        }
-        ImGui.EndChild();
+        mainWindow.Draw(puzzle, config);
+        if (mainWindow.ShowEditor && puzzle.HasRecording)
+            editorWindow.IsVisible = true;
+        editorWindow.Draw(puzzle);
     }
 
     private void SavePuzzle()
     {
-        string name = string.IsNullOrWhiteSpace(saveName) ? puzzle.Name : saveName;
-        puzzle.Name = name;
+        string name = puzzle.Name;
         int idx = config.SavedPuzzles.FindIndex(p => p.Name == name);
         if (idx >= 0) config.SavedPuzzles[idx] = puzzle.DeepCopy();
         else          config.SavedPuzzles.Add(puzzle.DeepCopy());
@@ -688,7 +426,6 @@ public sealed class Plugin : IDalamudPlugin
         string name = config.SavedPuzzles[idx].Name;
         config.SavedPuzzles.RemoveAt(idx);
         PluginInterface.SavePluginConfig(config);
-        if (loadIndex >= config.SavedPuzzles.Count) loadIndex = config.SavedPuzzles.Count - 1;
         ChatGui.Print($"[JumpSolver] Deleted '{name}'.");
     }
 

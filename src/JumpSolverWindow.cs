@@ -43,7 +43,7 @@ internal sealed class JumpSolverWindow : IDisposable
     // ── UI state ──────────────────────────────────────────────────────────────
     public  bool   IsVisible;
     private bool   _showDiag;
-    public  bool   ShowEditor    { get; private set; }
+    public  bool   ShowEditor    { get; set; }
     public  string SaveName      { get; private set; } = "";
     private int    _loadIndex    = -1;
 

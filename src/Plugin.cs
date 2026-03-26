@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Text.Json;
@@ -71,7 +72,33 @@ public sealed class Plugin : IDalamudPlugin
         diag         = new DiagCapture(Log);
         editorWindow = new FrameEditorWindow(TextureProvider)
         {
-            OnSave = SavePuzzle,
+            OnSave     = SavePuzzle,
+            OnTestJump = idx =>
+            {
+                if (!player.TryTestJump(puzzle, idx, out var err))
+                    ChatGui.Print($"[JumpSolver] {err}");
+            },
+            OnReRecordJump = idx =>
+            {
+                // Set up the splice callback, then navigate to the jump's run-up start.
+                // When navigation arrives, recording starts automatically.
+                // When the re-recorded jump lands, OnSingleJumpComplete splices + saves.
+                recorder.OnSingleJumpComplete = newFrames =>
+                {
+                    SpliceJumpFrames(puzzle, idx, newFrames);
+                    SavePuzzle();
+                    ChatGui.Print($"[JumpSolver] Jump {idx + 1} re-recorded and saved.");
+                };
+                if (!player.TryNavigateToJumpStart(puzzle, idx, () =>
+                {
+                    recorder.StartSingleJumpRecording();
+                    ChatGui.Print($"[JumpSolver] At Jump {idx + 1} run-up — perform the jump now.");
+                }, out var err))
+                {
+                    recorder.OnSingleJumpComplete = null;
+                    ChatGui.Print($"[JumpSolver] {err}");
+                }
+            },
         };
         mainWindow = new JumpSolverWindow(TextureProvider, player, recorder, mover, diag, ObjectTable)
         {
@@ -293,7 +320,17 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (recorder.State == RecordState.Recording)
         {
+            bool wasSingleJump = recorder.IsSingleJumpMode;
             recorder.StopRecording();
+
+            if (wasSingleJump)
+            {
+                // Re-record was cancelled manually — don't splice partial frames.
+                recorder.OnSingleJumpComplete = null;
+                ChatGui.Print("[JumpSolver] Re-record cancelled.");
+                return;
+            }
+
             if (pendingNewSegment)
             {
                 int num = puzzle.Segments.Count + 1;
@@ -317,6 +354,33 @@ public sealed class Plugin : IDalamudPlugin
             player.Stop("aborted");
             ChatGui.Print("[JumpSolver] Stopped.");
         }
+    }
+
+    /// <summary>
+    /// Replace the frames that belong to jump <paramref name="jumpIndex"/> (from the
+    /// frame after the previous jump up to and including the jump frame itself) with
+    /// <paramref name="newFrames"/>. All other jumps are kept intact.
+    /// </summary>
+    private static void SpliceJumpFrames(JumpPuzzle puzzle, int jumpIndex,
+                                          List<RecordedFrame> newFrames)
+    {
+        var allFrames = puzzle.Segments.SelectMany(s => s.Frames).ToList();
+        var jumpIdxs  = allFrames.Select((f, i) => (f, i))
+                                 .Where(x => x.f.Jump)
+                                 .Select(x => x.i)
+                                 .ToList();
+        if (jumpIndex < 0 || jumpIndex >= jumpIdxs.Count) return;
+
+        int jumpFrameIdx = jumpIdxs[jumpIndex];
+        int prevEnd      = jumpIndex > 0 ? jumpIdxs[jumpIndex - 1] + 1 : 0;
+
+        var result = new List<RecordedFrame>();
+        result.AddRange(allFrames.Take(prevEnd));
+        result.AddRange(newFrames);
+        result.AddRange(allFrames.Skip(jumpFrameIdx + 1));
+
+        puzzle.Segments.Clear();
+        puzzle.Segments.Add(new PuzzleSegment { Name = "Segment 1", Frames = result });
     }
 
     private void CmdPlay()
@@ -398,9 +462,14 @@ public sealed class Plugin : IDalamudPlugin
         DrawWorldMarker();
         if (showHud) DrawInputHud();
         mainWindow.Draw(puzzle, config);
-        if (mainWindow.ShowEditor && puzzle.HasRecording)
+        // Open editor when Edit Frames is clicked
+        if (mainWindow.ShowEditor && puzzle.HasRecording && !editorWindow.IsVisible)
             editorWindow.IsVisible = true;
-        editorWindow.Draw(puzzle);
+        bool isIdle = player.State == PlayState.Idle && recorder.State == RecordState.Idle;
+        editorWindow.Draw(puzzle, isIdle);
+        // Sync: if editor X button was clicked, reset ShowEditor so re-clicking Edit Frames works
+        if (!editorWindow.IsVisible)
+            mainWindow.ShowEditor = false;
     }
 
     private void SavePuzzle()

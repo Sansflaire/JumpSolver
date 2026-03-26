@@ -79,6 +79,15 @@ internal sealed unsafe class JumpPlayer
         return current + delta;
     }
 
+    // ── Test-jump mode — stop after a single jump lands instead of continuing ─────
+    private bool _testJumpMode = false;
+
+    // ── Nav-done callback — fires when WpNav arrives at its target ────────────
+    // Used by TryNavigateToJumpStart for the re-record jump flow.
+    // When set, arrival transitions to Idle and fires the callback instead of
+    // starting frame playback.
+    private Action? _navDoneCallback;
+
     // Timeout guards — if we get stuck, abort rather than loop forever.
     private int stateTimeoutFrames = 0;
     private const int LandTimeout  = 600;   // ~12 s
@@ -199,12 +208,136 @@ internal sealed unsafe class JumpPlayer
         return true;
     }
 
+    /// <summary>
+    /// Walk to the nav target for jump <paramref name="jumpIndex"/> and execute
+    /// only that jump. Stops as soon as the character lands.
+    /// </summary>
+    public bool TryTestJump(JumpPuzzle puzzle, int jumpIndex, out string error)
+    {
+        error = string.Empty;
+        if (!puzzle.HasRecording)   { error = "No recording to play.";       return false; }
+        if (!mover.IsAvailable)     { error = "Movement hook unavailable.";  return false; }
+        if (State != PlayState.Idle){ error = "Already playing — stop first."; return false; }
+
+        var lp = objects.LocalPlayer;
+        if (lp == null) { error = "Not logged in."; return false; }
+
+        var frames = puzzle.Segments.SelectMany(s => s.Frames).ToList();
+        var wps    = BuildWaypoints(frames);
+
+        if (jumpIndex < 0 || jumpIndex >= wps.Count)
+        {
+            error = $"Jump {jumpIndex + 1} has no nav waypoint.";
+            return false;
+        }
+
+        float dist = Vector3.Distance(lp.Position,
+            new Vector3(wps[jumpIndex].NavX, wps[jumpIndex].NavY, wps[jumpIndex].NavZ));
+        if (dist > 80f)
+        {
+            error = $"Too far from Jump {jumpIndex + 1} nav target ({dist:F0} yalms, max 80).";
+            return false;
+        }
+
+        this.puzzle        = puzzle;
+        playbackFrames     = frames;
+        FrameIndex         = 0;
+        frameTimer         = 0f;
+        waypoints          = wps;
+        // After landing we check waypointIndex vs waypoints.Count.
+        // Set waypointIndex to the last position so that after this jump
+        // lands, _testJumpMode causes an early stop before that check runs.
+        waypointIndex      = jumpIndex + 1;
+        _testJumpMode      = true;
+
+        var wp             = wps[jumpIndex];
+        navTargetX         = wp.NavX;
+        navTargetZ         = wp.NavZ;
+        navTargetY         = wp.NavY;
+        navFacing          = wp.NavFacing;
+        navResumeFrame     = wp.ResumeFrameIndex;
+        _vnavActive        = false;
+        stateTimeoutFrames = NavTimeout;
+        State              = PlayState.WpNav;
+
+        chat.Print($"[JumpSolver] Testing Jump {jumpIndex + 1} — navigating to run-up position.");
+        log.Info($"JumpPlayer: test jump {jumpIndex + 1} — nav to ({wp.NavX:F2}, {wp.NavZ:F2}), resume frame {wp.ResumeFrameIndex}.");
+        return true;
+    }
+
     public void Stop(string reason)
     {
         StopVnavmesh();
         mover.ClearInjection();
-        State = PlayState.Idle;
+        _testJumpMode    = false;
+        _navDoneCallback = null;
+        State            = PlayState.Idle;
         log.Info($"JumpPlayer: stopped — {reason}");
+    }
+
+    /// <summary>
+    /// Navigate to the run-up start position for <paramref name="jumpIndex"/>,
+    /// then fire <paramref name="onArrived"/> and return to Idle.
+    /// Used by the re-record jump flow — the callback starts recording.
+    /// </summary>
+    public bool TryNavigateToJumpStart(JumpPuzzle puzzle, int jumpIndex,
+                                       Action onArrived, out string error)
+    {
+        error = string.Empty;
+        if (!puzzle.HasRecording)    { error = "No recording.";               return false; }
+        if (!mover.IsAvailable)      { error = "Movement hook unavailable.";  return false; }
+        if (State != PlayState.Idle) { error = "Already playing — stop first."; return false; }
+
+        var lp = objects.LocalPlayer;
+        if (lp == null) { error = "Not logged in."; return false; }
+
+        var frames = puzzle.Segments.SelectMany(s => s.Frames).ToList();
+        var wps    = BuildWaypoints(frames);
+        if (jumpIndex < 0 || jumpIndex >= wps.Count)
+        {
+            error = $"Jump {jumpIndex + 1} has no nav waypoint.";
+            return false;
+        }
+
+        float dist = Vector3.Distance(lp.Position,
+            new Vector3(wps[jumpIndex].NavX, wps[jumpIndex].NavY, wps[jumpIndex].NavZ));
+        if (dist > 80f)
+        {
+            error = $"Too far from Jump {jumpIndex + 1} start ({dist:F0} yalms, max 80).";
+            return false;
+        }
+
+        this.puzzle        = puzzle;
+        playbackFrames     = frames;
+        waypoints          = wps;
+
+        var wp             = wps[jumpIndex];
+        navTargetX         = wp.NavX;
+        navTargetZ         = wp.NavZ;
+        navTargetY         = wp.NavY;
+        navFacing          = wp.NavFacing;
+        navResumeFrame     = wp.ResumeFrameIndex;
+        _vnavActive        = false;
+        _navDoneCallback   = onArrived;
+        stateTimeoutFrames = NavTimeout;
+        State              = PlayState.WpNav;
+
+        chat.Print($"[JumpSolver] Navigating to Jump {jumpIndex + 1} run-up position for re-recording.");
+        log.Info($"JumpPlayer: nav-to-start jump {jumpIndex + 1} ({wp.NavX:F2}, {wp.NavZ:F2}).");
+        return true;
+    }
+
+    /// <summary>
+    /// Returns the world-space nav target (run-up start) for the given zero-based
+    /// jump index, or null if the puzzle has no recording or the index is out of range.
+    /// </summary>
+    public static Vector3? GetNavTarget(JumpPuzzle puzzle, int jumpIndex)
+    {
+        if (!puzzle.HasRecording) return null;
+        var frames = puzzle.Segments.SelectMany(s => s.Frames).ToList();
+        var wps    = BuildWaypoints(frames);
+        if (jumpIndex < 0 || jumpIndex >= wps.Count) return null;
+        return new Vector3(wps[jumpIndex].NavX, wps[jumpIndex].NavY, wps[jumpIndex].NavZ);
     }
 
     private void StopVnavmesh()
@@ -440,6 +573,14 @@ internal sealed unsafe class JumpPlayer
                 // Landed — clear injection now that we're on solid ground.
                 mover.ClearInjection();
 
+                if (_testJumpMode)
+                {
+                    _testJumpMode = false;
+                    chat.Print("[JumpSolver] Test jump landed.");
+                    Stop("test jump complete");
+                    return;
+                }
+
                 if (waypointIndex >= waypoints.Count)
                 {
                     // Last jump — no more run-ups to navigate to. Resume normal playback
@@ -499,6 +640,19 @@ internal sealed unsafe class JumpPlayer
                 StopVnavmesh();
                 mover.ClearInjection();
                 mover.SetPlayerFacing(playerAddress, navFacing);
+
+                // Re-record / nav-only mode: fire callback then go Idle instead of
+                // starting frame playback.
+                if (_navDoneCallback != null)
+                {
+                    var cb = _navDoneCallback;
+                    _navDoneCallback = null;
+                    State = PlayState.Idle;
+                    log.Info("JumpPlayer: reached nav target — firing arrival callback.");
+                    cb();
+                    return;
+                }
+
                 // Don't hard-set camera here — let TickPlayback's ApplyCamAngle track it
                 // smoothly from whatever angle it reached during WpNav.
                 FrameIndex = navResumeFrame;

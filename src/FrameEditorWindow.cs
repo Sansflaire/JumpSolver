@@ -64,7 +64,9 @@ internal sealed class FrameEditorWindow : IDisposable
     private int  _dragFrame;           // frame index being dragged
 
     // Callbacks
-    public Action? OnSave;
+    public Action?      OnSave;
+    public Action<int>? OnTestJump;      // parameter = zero-based jump index
+    public Action<int>? OnReRecordJump;  // parameter = zero-based jump index
 
     // Accent colour (green, matching plugin theme)
     private static readonly PColor Accent      = PColor.FromHex("#2ECC70");
@@ -86,7 +88,7 @@ internal sealed class FrameEditorWindow : IDisposable
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    public void Draw(JumpPuzzle puzzle)
+    public void Draw(JumpPuzzle puzzle, bool isIdle = true)
     {
         if (!IsVisible || !puzzle.HasRecording) return;
 
@@ -384,6 +386,40 @@ internal sealed class FrameEditorWindow : IDisposable
 
         ImGui.PopStyleColor(3);
 
+        // ── Nav target shift ──────────────────────────────────────────────────
+        // Shows the computed run-up start position for this jump and lets you
+        // drag it to a new XZ. All frame positions in this jump's window shift
+        // by the same delta so BuildWaypoints picks up the new nav target.
+        var navTarget = JumpPlayer.GetNavTarget(puzzle, _jumpIdx);
+        if (navTarget.HasValue)
+        {
+            float navX = navTarget.Value.X, navZ = navTarget.Value.Z;
+            float navXOld = navX, navZOld = navZ;
+
+            ImGui.Spacing();
+            ImGui.PushStyleColor(ImGuiCol.Text,    new Vector4(0.60f, 0.60f, 0.65f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.FrameBg, new Vector4(0.07f, 0.10f, 0.18f, 1f));
+            ImGui.Text("Nav start (run-up XZ)");
+            ImGui.SameLine(200f);
+            ImGui.SetNextItemWidth(110f);
+            bool xCh = ImGui.DragFloat("##navX", ref navX, 0.01f, -10000f, 10000f, "X %.2f");
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(110f);
+            bool zCh = ImGui.DragFloat("##navZ", ref navZ, 0.01f, -10000f, 10000f, "Z %.2f");
+            ImGui.PopStyleColor(2);
+
+            if (xCh || zCh)
+            {
+                float dX = navX - navXOld;
+                float dZ = navZ - navZOld;
+                for (int i = prevEnd; i <= jumpFrameIdx; i++)
+                {
+                    allFrames[i].PosX += dX;
+                    allFrames[i].PosZ += dZ;
+                }
+            }
+        }
+
         ImGui.Spacing();
 
         // ═════════════════════════════════════════════════════════════════════
@@ -467,7 +503,40 @@ internal sealed class FrameEditorWindow : IDisposable
 
         ImGui.Spacing();
 
+        // Test this jump
+        if (!isIdle) ImGui.BeginDisabled();
+        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.12f, 0.30f, 0.55f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.18f, 0.45f, 0.80f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.25f, 0.60f, 1.00f, 1f));
+        if (ImGui.Button($"▶ Test Jump {_jumpIdx + 1}##test", new Vector2(160f, 0)))
+            OnTestJump?.Invoke(_jumpIdx);
+        ImGui.PopStyleColor(3);
+        if (!isIdle) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(isIdle
+                ? $"Walk to Jump {_jumpIdx + 1}'s run-up position and execute just that jump."
+                : "Stop playback first.");
+
+        ImGui.SameLine();
+
+        // Re-record this jump
+        if (!isIdle) ImGui.BeginDisabled();
+        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.38f, 0.14f, 0.52f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.55f, 0.20f, 0.75f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.72f, 0.28f, 1.00f, 1f));
+        if (ImGui.Button($"⏺ Re-record Jump {_jumpIdx + 1}##rerec", new Vector2(190f, 0)))
+            OnReRecordJump?.Invoke(_jumpIdx);
+        ImGui.PopStyleColor(3);
+        if (!isIdle) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(isIdle
+                ? $"Navigate to Jump {_jumpIdx + 1}'s run-up start, then record just that jump.\nRecording stops automatically on landing."
+                : "Stop playback first.");
+
+        ImGui.SameLine();
+
         // Trim after current jump
+        if (!isIdle) ImGui.BeginDisabled();
         ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.45f, 0.22f, 0.10f, 1f));
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.65f, 0.30f, 0.14f, 1f));
         ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.85f, 0.40f, 0.20f, 1f));
@@ -476,9 +545,10 @@ internal sealed class FrameEditorWindow : IDisposable
             var kept = allFrames.Take(jumpFrameIdx + 1).ToList();
             puzzle.Segments.Clear();
             puzzle.Segments.Add(new PuzzleSegment { Name = "Segment 1", Frames = kept });
-            _jumpIdx = 0;   // reset to first jump since the list shrank
+            _jumpIdx = 0;
         }
         ImGui.PopStyleColor(3);
+        if (!isIdle) ImGui.EndDisabled();
 
         ImGui.SameLine();
         ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.10f, 0.45f, 0.22f, 1f));

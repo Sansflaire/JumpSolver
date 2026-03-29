@@ -24,6 +24,9 @@ public sealed class RecordedFrame
     public float SumLeft     { get; set; }   // raw RMI — replayed exactly
     public float CameraYaw   { get; set; }   // DirH — replayed each frame
     public float CameraPitch { get; set; }   // DirV — replayed each frame
+    // When true, BuildWaypoints uses this frame as the nav target + replay start for the
+    // next jump. Lets winding approach paths be replayed rather than navigated by vnavmesh.
+    public bool  PathAnchor  { get; set; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,6 +50,7 @@ public sealed class PuzzleSegment
                 Moving      = f.Moving,     Jump        = f.Jump,
                 SumForward  = f.SumForward, SumLeft     = f.SumLeft,
                 CameraYaw   = f.CameraYaw,  CameraPitch = f.CameraPitch,
+                PathAnchor  = f.PathAnchor,
             });
         return copy;
     }

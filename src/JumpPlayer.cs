@@ -741,10 +741,33 @@ internal sealed unsafe class JumpPlayer
 
     private static List<JumpWaypoint> BuildWaypoints(List<RecordedFrame> frames)
     {
-        var result = new List<JumpWaypoint>();
+        var result        = new List<JumpWaypoint>();
+        int prevJumpFrame = -1;
         for (int i = 0; i < frames.Count; i++)
         {
             if (!frames[i].Jump) continue;
+
+            // ── Path anchor override — bypasses all standstill detection ─────────────
+            // If any frame between the previous jump and this one is marked PathAnchor,
+            // use the FIRST such frame as the nav target and replay-start. This lets
+            // winding approach paths be fully replayed rather than navigated by vnavmesh.
+            int rangeStart   = prevJumpFrame + 1;
+            int pathAnchorIdx = -1;
+            for (int k = rangeStart; k < i; k++)
+            {
+                if (frames[k].PathAnchor) { pathAnchorIdx = k; break; }
+            }
+            if (pathAnchorIdx >= 0)
+            {
+                result.Add(new JumpWaypoint(
+                    frames[pathAnchorIdx].PosX,
+                    frames[pathAnchorIdx].PosZ,
+                    frames[pathAnchorIdx].PosY,
+                    frames[pathAnchorIdx].Facing,
+                    pathAnchorIdx));   // replay starts at the anchor — winding path included
+                prevJumpFrame = i;
+                continue;
+            }
 
             // ── Step 1: initial navIdx — Y-step detection or 90-frame fallback ──────
             // Scan backward to find a terrain step-up in the run-up. If found, place
@@ -813,6 +836,7 @@ internal sealed unsafe class JumpPlayer
                 frames[navIdx].PosY,
                 frames[navIdx].Facing,
                 runUpStart));
+            prevJumpFrame = i;
         }
         return result;
     }

@@ -466,7 +466,7 @@ public sealed class Plugin : IDalamudPlugin
         if (mainWindow.ShowEditor && puzzle.HasRecording && !editorWindow.IsVisible)
             editorWindow.IsVisible = true;
         bool isIdle = player.State == PlayState.Idle && recorder.State == RecordState.Idle;
-        editorWindow.Draw(puzzle, isIdle);
+        editorWindow.Draw(puzzle, isIdle, ObjectTable.LocalPlayer?.Position);
         // Sync: if editor X button was clicked, reset ShowEditor so re-clicking Edit Frames works
         if (!editorWindow.IsVisible)
             mainWindow.ShowEditor = false;

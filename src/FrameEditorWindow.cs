@@ -88,7 +88,7 @@ internal sealed class FrameEditorWindow : IDisposable
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    public void Draw(JumpPuzzle puzzle, bool isIdle = true)
+    public void Draw(JumpPuzzle puzzle, bool isIdle = true, Vector3? playerPos = null)
     {
         if (!IsVisible || !puzzle.HasRecording) return;
 
@@ -417,6 +417,69 @@ internal sealed class FrameEditorWindow : IDisposable
                     allFrames[i].PosX += dX;
                     allFrames[i].PosZ += dZ;
                 }
+            }
+        }
+
+        ImGui.Spacing();
+
+        // ── Path Anchor ───────────────────────────────────────────────────────────
+        // For winding approach paths vnavmesh can't navigate. Mark a frame at the
+        // start of the winding section; WpNav navigates there, then frame playback
+        // replays the full path (winding run + standstill + run-up + jump).
+        {
+            int anchorFrame = -1;
+            for (int k = prevEnd; k < jumpFrameIdx; k++)
+                if (allFrames[k].PathAnchor) { anchorFrame = k; break; }
+
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.70f, 0.60f, 0.90f, 1f));
+            if (anchorFrame >= 0)
+            {
+                var af = allFrames[anchorFrame];
+                ImGui.Text($"Path anchor  frame {anchorFrame}  ({af.PosX:F1}, {af.PosY:F1}, {af.PosZ:F1})");
+                ImGui.PopStyleColor();
+                ImGui.SameLine();
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.40f, 0.10f, 0.10f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.60f, 0.16f, 0.16f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.80f, 0.22f, 0.22f, 1f));
+                if (ImGui.Button("Clear##anchorClear"))
+                    allFrames[anchorFrame].PathAnchor = false;
+                ImGui.PopStyleColor(3);
+            }
+            else
+            {
+                ImGui.Text("Path anchor: auto (standstill detection)");
+                ImGui.PopStyleColor();
+                ImGui.SameLine();
+                bool canSet = playerPos.HasValue;
+                if (!canSet) ImGui.BeginDisabled();
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.20f, 0.14f, 0.40f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.30f, 0.20f, 0.58f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.42f, 0.30f, 0.78f, 1f));
+                if (ImGui.Button("Set at player pos##anchorSet") && playerPos.HasValue)
+                {
+                    // Find the recorded frame whose XZ is closest to the player's
+                    // current position. Exclude the final 30 frames before the jump
+                    // so we can't accidentally anchor inside the run-up itself.
+                    int searchEnd = Math.Max(prevEnd, jumpFrameIdx - 30);
+                    int best      = prevEnd;
+                    float bestD   = float.MaxValue;
+                    for (int k = prevEnd; k <= searchEnd; k++)
+                    {
+                        float dx = allFrames[k].PosX - playerPos.Value.X;
+                        float dz = allFrames[k].PosZ - playerPos.Value.Z;
+                        float d  = dx * dx + dz * dz;
+                        if (d < bestD) { bestD = d; best = k; }
+                    }
+                    allFrames[best].PathAnchor = true;
+                }
+                ImGui.PopStyleColor(3);
+                if (!canSet) ImGui.EndDisabled();
+                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip(
+                        "Stand at the start of the winding approach path\n" +
+                        "(where you stood when you began recording this jump's run-in),\n" +
+                        "then click. WpNav will navigate here, then replay all frames\n" +
+                        "from this point — including the full winding path.");
             }
         }
 
